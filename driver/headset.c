@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/hrtimer.h>
 #include <linux/version.h>
+#include <sound/control.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
@@ -57,6 +58,11 @@ struct gip_headset {
 	int start_counter;
 	bool got_initial_volume;
 	bool got_audio_packet;
+
+	/* microphone muted by the button on the headset */
+	bool mic_muted;
+	struct snd_card *card;
+	struct snd_kcontrol *mute_ctl;
 
 	struct hrtimer timer;
 	struct hrtimer start_audio_timer;
@@ -291,9 +297,30 @@ static enum hrtimer_restart gip_headset_start_audio(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+static int gip_headset_mute_get(struct snd_kcontrol *kctl,
+				struct snd_ctl_elem_value *val)
+{
+	struct gip_headset *headset = snd_kcontrol_chip(kctl);
+
+	/* switch is on when the microphone is live */
+	val->value.integer.value[0] = !READ_ONCE(headset->mic_muted);
+
+	return 0;
+}
+
+/* read-only: the mute state is owned by the button on the headset */
+static const struct snd_kcontrol_new gip_headset_mute_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Capture Switch",
+	.access = SNDRV_CTL_ELEM_ACCESS_READ,
+	.info = snd_ctl_boolean_mono_info,
+	.get = gip_headset_mute_get,
+};
+
 static int gip_headset_init_pcm(struct gip_headset *headset)
 {
 	struct snd_card *card;
+	struct snd_kcontrol *kctl;
 	struct snd_pcm *pcm;
 	int err;
 
@@ -318,9 +345,18 @@ static int gip_headset_init_pcm(struct gip_headset *headset)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &gip_headset_pcm_ops);
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 
+	kctl = snd_ctl_new1(&gip_headset_mute_ctl, headset);
+	err = snd_ctl_add(card, kctl);
+	if (err)
+		goto err_free_card;
+
 	err = snd_card_register(card);
 	if (err)
 		goto err_free_card;
+
+	/* publish only once the card can no longer be freed on error */
+	headset->card = card;
+	smp_store_release(&headset->mute_ctl, kctl);
 
 	return 0;
 
@@ -494,12 +530,23 @@ static int gip_headset_op_audio_ready(struct gip_client *client)
 }
 
 static int gip_headset_op_audio_volume(struct gip_client *client,
-				       u8 in, u8 out)
+				       u8 in, u8 out, bool mic_muted)
 {
 	struct gip_headset *headset = dev_get_drvdata(&client->dev);
+	struct snd_kcontrol *kctl;
 
 	/* headset reported initial volume, ready to start audio I/O */
 	headset->got_initial_volume = true;
+
+	/* report mute button changes to userspace (e.g. PipeWire) */
+	if (READ_ONCE(headset->mic_muted) != mic_muted) {
+		WRITE_ONCE(headset->mic_muted, mic_muted);
+
+		kctl = smp_load_acquire(&headset->mute_ctl);
+		if (kctl)
+			snd_ctl_notify(headset->card,
+				       SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+	}
 
 	/* ignore hardware volume, let software handle volume changes */
 	return 0;
