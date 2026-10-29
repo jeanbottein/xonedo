@@ -160,7 +160,8 @@ static const struct snd_pcm_ops gip_headset_pcm_ops = {
 static bool gip_headset_advance_pointer(struct gip_headset_stream *stream,
 					int len, size_t buf_size)
 {
-	snd_pcm_uframes_t period = stream->substream->runtime->period_size;
+	/* pointer and period are counted in bytes, period_size in frames */
+	size_t period = snd_pcm_lib_period_bytes(stream->substream);
 
 	stream->pointer += len;
 	if (stream->pointer >= buf_size)
