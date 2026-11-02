@@ -442,8 +442,13 @@ static int xone_mt76_send_firmware_part(struct xone_mt76 *mt, u32 offset,
 
 		complete = 0xc0000000 | (chunk_len << 16);
 		if (!xone_mt76_poll(mt, MT_FCE_DMA_LEN | MT_VEND_TYPE_CFG,
-				    0xffffffff, complete))
+				    0xffffffff, complete)) {
+			dev_err(mt->dev, "%s: chunk at 0x%x not done: DMA_LEN=0x%08x\n",
+				__func__, offset + pos,
+				xone_mt76_read_register(mt, MT_FCE_DMA_LEN |
+							MT_VEND_TYPE_CFG));
 			return -ETIMEDOUT;
+		}
 	}
 
 	return 0;
@@ -625,6 +630,67 @@ static int xone_mt76_wait_for_mac(struct xone_mt76 *mt)
  * WLAN block before every firmware load (mt76x2u_init_hardware()), so do the
  * same before resetting the MCU.
  */
+/* RX/TX queue page counters checked by mainline mt76x2u_mac_stop() */
+static void xone_mt76_log_queues(struct xone_mt76 *mt, const char *when)
+{
+	dev_dbg(mt->dev,
+		"%s: %s: MAC_SYS_CTRL=0x%08x U3DMA_CFG=0x%08x 0430=0x%08x 0438=0x%08x 0a30=0x%08x 0a34=0x%08x\n",
+		__func__, when,
+		xone_mt76_read_register(mt, MT_MAC_SYS_CTRL),
+		xone_mt76_read_register(mt, XONE_MT_CFG(MT_USB_U3DMA_CFG)),
+		xone_mt76_read_register(mt, 0x0430),
+		xone_mt76_read_register(mt, 0x0438),
+		xone_mt76_read_register(mt, 0x0a30),
+		xone_mt76_read_register(mt, 0x0a34));
+}
+
+#define XONE_MT_DRAIN_LEN 0x10000
+
+/* read and drop what the chip still holds for the host on one endpoint */
+static void xone_mt76_drain_ep(struct xone_mt76 *mt, u8 ep, void *buf,
+			       const char *when)
+{
+	int i, err = 0, actual, total = 0;
+
+	for (i = 0; i < 512; i++) {
+		actual = 0;
+		err = usb_bulk_msg(mt->udev, usb_rcvbulkpipe(mt->udev, ep),
+				   buf, XONE_MT_DRAIN_LEN, &actual, 20);
+		total += actual;
+		if (err)
+			break;
+	}
+
+	dev_dbg(mt->dev, "%s: %s: ep 0x%02x: %d transfers, %d bytes, end %d\n",
+		__func__, when, ep, i, total, err);
+}
+
+static void xone_mt76_drain(struct xone_mt76 *mt, const char *when)
+{
+	void *buf = kmalloc(XONE_MT_DRAIN_LEN, GFP_KERNEL);
+
+	if (!buf)
+		return;
+
+	xone_mt76_drain_ep(mt, XONE_MT_EP_IN_WLAN, buf, when);
+	xone_mt76_drain_ep(mt, XONE_MT_EP_IN_CMD, buf, when);
+	kfree(buf);
+	xone_mt76_log_queues(mt, when);
+}
+
+/*
+ * On a warm chip the old firmware is still running with the MAC receiving,
+ * and nobody has read the RX endpoints since the driver went away. Stop RX/TX
+ * (mainline mt76x2u_mac_stop()) and read out what the chip still holds.
+ */
+static void xone_mt76_quiesce(struct xone_mt76 *mt)
+{
+	xone_mt76_log_queues(mt, "warm");
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+	msleep(20);
+	xone_mt76_drain(mt, "mac stopped");
+}
+
 static int xone_mt76_reset_wlan_hw(struct xone_mt76 *mt)
 {
 	xone_mt76_reset_wlan(mt);
@@ -661,6 +727,8 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
+		xone_mt76_quiesce(mt);
+
 		err = xone_mt76_reset_wlan_hw(mt);
 		if (err)
 			return err;
@@ -668,13 +736,17 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 		err = xone_mt76_reset_firmware(mt);
 		if (err)
 			return err;
+
+		xone_mt76_drain(mt, "mcu reset");
 	}
 
 	dev_dbg(mt->dev, "%s: loading firmware...\n", __func__);
 
 	err = xone_mt76_send_firmware(mt, fw);
-	if (err)
+	if (err) {
+		xone_mt76_log_queues(mt, "upload failed");
 		return err;
+	}
 
 	xone_mt76_write_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG, 0);
 
