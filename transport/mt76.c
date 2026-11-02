@@ -1242,6 +1242,26 @@ static void xone_mt76_reset_client_slots(struct xone_mt76 *mt, int keys,
 	}
 }
 
+/* debug: which WCID slots hold an address, and their attributes */
+void xone_mt76_log_client_slots(struct xone_mt76 *mt)
+{
+	u32 lo, hi;
+	int i;
+
+	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
+		lo = xone_mt76_read_register(mt, MT_WCID_ADDR(i));
+		hi = xone_mt76_read_register(mt, MT_WCID_ADDR(i) + 4) & 0xffff;
+		if (!lo && !hi)
+			continue;
+
+		dev_info(mt->dev,
+			 "xone-fix: chip slot %d: address %02x:%02x:%02x:%02x:%02x:%02x attr=0x%08x\n",
+			 i, lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff,
+			 lo >> 24, hi & 0xff, hi >> 8,
+			 xone_mt76_read_register(mt, MT_WCID_ATTR(i)));
+	}
+}
+
 void xone_mt76_stop_rx(struct xone_mt76 *mt)
 {
 	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);

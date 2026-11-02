@@ -71,6 +71,7 @@ void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd);
 int xone_mt76_set_led_mode(struct xone_mt76 *mt, enum xone_mt76_led_mode mode);
 int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw);
 void xone_mt76_stop_rx(struct xone_mt76 *mt);
+void xone_mt76_log_client_slots(struct xone_mt76 *mt);
 int xone_mt76_init_radio(struct xone_mt76 *mt);
 int xone_mt76_suspend_radio(struct xone_mt76 *mt);
 int xone_mt76_resume_radio(struct xone_mt76 *mt);
