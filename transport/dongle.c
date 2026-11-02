@@ -144,6 +144,24 @@ static bool xone_dongle_wants_pairing_scan(struct xone_dongle *dongle)
 	return dongle->product != 0x02e6;
 }
 
+/*
+ * A firmware session that ignores our writes was only ever cured by a USB
+ * reset. At most once a minute, so this can't loop.
+ */
+static bool xone_dongle_self_reset(struct xone_dongle *dongle,
+				   const char *why)
+{
+	if (dongle->self_reset_time &&
+	    time_before(jiffies, dongle->self_reset_time + 60 * HZ))
+		return false;
+
+	dongle->self_reset_time = jiffies | 1;
+	dev_warn(dongle->mt.dev, "xone-fix: %s: resetting the dongle\n", why);
+	usb_queue_reset_device(to_usb_interface(dongle->mt.dev));
+
+	return true;
+}
+
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
 				    struct sk_buff *skb,
 				    enum xone_dongle_queue queue)
@@ -566,23 +584,16 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 			dev_err(dongle->mt.dev, "%s: remove client failed: %d\n",
 				__func__, err);
 
-		/*
-		 * Still retrying: the firmware session is likely ignoring our
-		 * writes, which only a USB reset has cured. At most once a
-		 * minute, so this can't loop.
-		 */
+		/* safety net for anything else that leaves a client stuck */
 		if (client->assoc_retries == 3 &&
-		    (!dongle->self_reset_time ||
-		     time_after(jiffies, dongle->self_reset_time + 60 * HZ))) {
-			dongle->self_reset_time = jiffies | 1;
-			dev_warn(dongle->mt.dev,
-				 "xone-fix: controller %pM still can't connect: resetting the dongle\n",
-				 addr);
-			usb_queue_reset_device(to_usb_interface(dongle->mt.dev));
+		    xone_dongle_self_reset(dongle, "controller still can't connect"))
 			return 0;
-		}
 
-		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
+		err = xone_mt76_associate_client(&dongle->mt, i + 1, addr);
+		if (err == -EIO)
+			xone_dongle_self_reset(dongle, "firmware ignored the client address");
+
+		return err;
 	}
 
 	client = xone_dongle_create_client(dongle, addr);
@@ -592,6 +603,8 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	client->assoc_time = jiffies;
 
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
+	if (err == -EIO)
+		xone_dongle_self_reset(dongle, "firmware ignored the client address");
 	if (err)
 		goto err_free_client;
 

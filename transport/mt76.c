@@ -1550,16 +1550,16 @@ static bool xone_mt76_client_addr_is(struct xone_mt76 *mt, u8 wcid,
 }
 
 /*
- * The firmware needs the client's address written through its burst write
- * (a direct register write breaks the GIP handshake), but that command is not
- * acknowledged and was seen not to land: the client's frames then all came in
- * as WCID 0xff and it could never connect. Check, and write again.
+ * The firmware must get the client's address through its burst write (a
+ * direct register write lets frames in, but the GIP handshake never goes on).
+ * That command is not acknowledged, and in some firmware sessions it is
+ * ignored until a USB reset: the client's frames then all come in as WCID
+ * 0xff. Check, write again, and return -EIO if it never lands.
  */
 static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
 				       u8 *addr)
 {
 	int try, i, err;
-	u32 hi;
 
 	for (try = 1; try <= 3; try++) {
 		err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr,
@@ -1583,21 +1583,7 @@ static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
 			 wcid, try);
 	}
 
-	/*
-	 * Some firmware sessions ignore these burst writes until a USB reset.
-	 * Write the 6 address bytes directly, keeping the rest of the entry as
-	 * the burst write would.
-	 */
-	hi = xone_mt76_read_register(mt, MT_WCID_ADDR(wcid) + 4);
-	xone_mt76_write_register(mt, MT_WCID_ADDR(wcid),
-				 get_unaligned_le32(addr));
-	xone_mt76_write_register(mt, MT_WCID_ADDR(wcid) + 4,
-				 (hi & 0xffff0000) | get_unaligned_le16(addr + 4));
-	dev_warn(mt->dev,
-		 "xone-fix: WCID %d address written directly: %s\n", wcid,
-		 xone_mt76_client_addr_is(mt, wcid, addr) ? "landed" : "did not land");
-
-	return 0;
+	return -EIO;
 }
 
 int xone_mt76_associate_client(struct xone_mt76 *mt, u8 wcid, u8 *addr)
