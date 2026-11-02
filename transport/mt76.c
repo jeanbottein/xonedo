@@ -624,12 +624,6 @@ static int xone_mt76_wait_for_mac(struct xone_mt76 *mt)
 	return -ETIMEDOUT;
 }
 
-/*
- * A warm chip (USB power never cut) keeps its RF state and its BBP/PBF/FCE/TSO
- * memories through an MCU reset. Mainline mt76x2u resets and powers up the
- * WLAN block before every firmware load (mt76x2u_init_hardware()), so do the
- * same before resetting the MCU.
- */
 /* RX/TX queue page counters checked by mainline mt76x2u_mac_stop() */
 static void xone_mt76_log_queues(struct xone_mt76 *mt, const char *when)
 {
@@ -691,6 +685,21 @@ static void xone_mt76_quiesce(struct xone_mt76 *mt)
 	xone_mt76_drain(mt, "mac stopped");
 }
 
+/*
+ * Put the WLAN block back to its power-on state before a warm firmware load.
+ *
+ * A warm chip (USB power never cut: reboot, resume, driver reload) keeps its RF
+ * state and its BBP/PBF/FCE/TSO memories through an MCU reset. MediaTek's
+ * reference driver resets them at every start ("Restore all HW default value
+ * and reset RF", rlt_wlan_chip_onoff() + mt76x2_pwrOn()), and mainline mt76x2
+ * has done the same since its first version (PCIe 7bc04215a66b, USB
+ * ee676cd5017c), at every probe and every resume: mt76x2u_init_hardware(),
+ * mt76x2_resume_device(). xone was written from captures of a cold start,
+ * where this step is a no-op, so it never had it.
+ *
+ * On its own it did not cure the warm-load upload stalls (the RX drain did),
+ * but it is the vendor's procedure for exactly this case, so keep it.
+ */
 static int xone_mt76_reset_wlan_hw(struct xone_mt76 *mt)
 {
 	xone_mt76_reset_wlan(mt);
