@@ -1537,6 +1537,54 @@ int xone_mt76_pair_client(struct xone_mt76 *mt, u8 *addr)
 	return xone_mt76_send_wlan(mt, skb);
 }
 
+static bool xone_mt76_client_addr_is(struct xone_mt76 *mt, u8 wcid,
+				     const u8 *addr)
+{
+	u8 cur[8];
+
+	put_unaligned_le32(xone_mt76_read_register(mt, MT_WCID_ADDR(wcid)), cur);
+	put_unaligned_le32(xone_mt76_read_register(mt, MT_WCID_ADDR(wcid) + 4),
+			   cur + 4);
+
+	return !memcmp(cur, addr, ETH_ALEN);
+}
+
+/*
+ * The firmware needs the client's address written through its burst write
+ * (a direct register write breaks the GIP handshake), but that command is not
+ * acknowledged and was seen not to land: the client's frames then all came in
+ * as WCID 0xff and it could never connect. Check, and write again.
+ */
+static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
+				       u8 *addr)
+{
+	int try, i, err;
+
+	for (try = 1; try <= 3; try++) {
+		err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr,
+					    ETH_ALEN);
+		if (err)
+			return err;
+
+		for (i = 0; i < 5; i++) {
+			if (xone_mt76_client_addr_is(mt, wcid, addr)) {
+				if (try > 1)
+					dev_info(mt->dev,
+						 "xone-fix: WCID %d address landed on write %d\n",
+						 wcid, try);
+				return 0;
+			}
+			usleep_range(2000, 4000);
+		}
+
+		dev_warn(mt->dev,
+			 "xone-fix: WCID %d address write %d did not land\n",
+			 wcid, try);
+	}
+
+	return 0;
+}
+
 int xone_mt76_associate_client(struct xone_mt76 *mt, u8 wcid, u8 *addr)
 {
 	struct sk_buff *skb;
@@ -1565,7 +1613,7 @@ int xone_mt76_associate_client(struct xone_mt76 *mt, u8 wcid, u8 *addr)
 	skb_put_data(skb, &mgmt, mgmt_len);
 	memset(skb_put(skb, 8), 0, 8);
 
-	err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr, ETH_ALEN);
+	err = xone_mt76_write_client_addr(mt, wcid, addr);
 	if (err)
 		goto err_free_skb;
 
