@@ -586,6 +586,8 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request)\n",
 			 addr, client->assoc_retries + 1,
 			 jiffies_to_msecs(jiffies - client->assoc_time));
+		if (!client->assoc_retries)
+			xone_mt76_log_client_slots(&dongle->mt);
 
 		/* safety net for anything else that leaves a client stuck */
 		if (++client->assoc_retries == 3 &&
@@ -922,6 +924,46 @@ static int xone_dongle_handle_loss(struct xone_dongle *dongle,
 	return xone_dongle_handle_disassociation(dongle, wcid);
 }
 
+/*
+ * Debug: frames from one of our controllers that would be dropped silently
+ * (data without a matching WCID, or a frame type we ignore). This is how
+ * WCID 0xff (address missing from the WCID table) was found.
+ */
+static void xone_dongle_log_dropped(struct xone_dongle *dongle,
+				    struct ieee80211_hdr_3addr *hdr, u16 type,
+				    u8 wcid)
+{
+	u16 kind = type & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE);
+	unsigned long flags;
+	int i;
+
+	switch (kind) {
+	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ASSOC_REQ:
+	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DISASSOC:
+	case IEEE80211_FTYPE_MGMT | XONE_MT_WLAN_RESERVED:
+		return;
+	}
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+
+	if (kind == (IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA) &&
+	    wcid && wcid <= XONE_DONGLE_MAX_CLIENTS && dongle->clients[wcid - 1])
+		goto out_unlock;
+
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		if (dongle->clients[i] &&
+		    ether_addr_equal(dongle->clients[i]->address, hdr->addr2)) {
+			dev_info_ratelimited(dongle->mt.dev,
+					     "xone-fix: dropped frame from controller %pM: type 0x%04x, chip slot %u (driver slot %d)\n",
+					     hdr->addr2, kind, wcid, i + 1);
+			break;
+		}
+	}
+
+out_unlock:
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+}
+
 static int xone_dongle_process_frame(struct xone_dongle *dongle,
 				     struct sk_buff *skb,
 				     unsigned int hdr_len, u8 wcid)
@@ -944,6 +986,8 @@ static int xone_dongle_process_frame(struct xone_dongle *dongle,
 
 	skb_pull(skb, hdr_len);
 	type = le16_to_cpu(hdr->frame_control);
+
+	xone_dongle_log_dropped(dongle, hdr, type, wcid);
 
 	switch (type & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE)) {
 	case IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA:
