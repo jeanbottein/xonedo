@@ -60,7 +60,13 @@ struct xone_mt76 {
 
 	struct xone_mt76_channel channels[XONE_MT_NUM_CHANNELS];
 	struct xone_mt76_channel *channel;
+
+	/* firmware load attempt number, for the xone-fix log line */
+	int fw_attempt;
 };
+
+/* test switches: 0 = off, 1 = on, 2 = random each time it applies */
+bool xone_fix_pick(int setting);
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
 void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd);

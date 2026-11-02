@@ -22,6 +22,10 @@ ushort fw_override_pid = 0;
 MODULE_PARM_DESC(fw_override, "Use firmware for the provided product ID instead of the one detected automatically");
 module_param_named(fw_override, fw_override_pid, ushort, 0600);
 
+static int fix_hop_back = 1;
+module_param(fix_hop_back, int, 0644);
+MODULE_PARM_DESC(fix_hop_back, "Pairing: switch back to the channel before the last hop when a controller retries its association (0=off, 1=on, 2=random per controller)");
+
 #define XONE_DONGLE_NUM_IN_URBS 12
 #define XONE_DONGLE_NUM_OUT_URBS 12
 
@@ -62,6 +66,9 @@ struct xone_dongle_client {
 	/* other channel to try if this client retries (before/after a hop) */
 	u8 hop_back_idx;
 	int hop_flips;
+	/* associated within a scan interval of a hop; switch-back allowed */
+	bool hop_armed;
+	bool hop_enabled;
 	/* connection timing, logged with the first data from the client */
 	unsigned long assoc_time;
 	int assoc_retries;
@@ -590,6 +597,7 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 		 * previous one first, back again if that was the wrong guess.
 		 */
 		if (client->hop_back_idx != XONE_DONGLE_HOP_NONE &&
+		    client->hop_enabled &&
 		    client->hop_flips < XONE_DONGLE_HOP_MAX_FLIPS) {
 			u8 cur_idx = xone_dongle_find_channel_idx(dongle);
 
@@ -611,8 +619,10 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 
 	client->assoc_time = jiffies;
 	client->hop_back_idx = XONE_DONGLE_HOP_NONE;
+	client->hop_enabled = xone_fix_pick(fix_hop_back);
 	if (dongle->hop_prev_idx != XONE_DONGLE_HOP_NONE &&
 	    time_before(jiffies, dongle->hop_time + XONE_DONGLE_HOP_GRACE)) {
+		client->hop_armed = true;
 		client->hop_back_idx = dongle->hop_prev_idx;
 		dev_info(dongle->mt.dev,
 			 "xone-fix: controller %pM connected %u ms after a channel hop %u -> %u (it may miss our answer; will switch if it retries)\n",
@@ -806,11 +816,12 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		if (!client->first_data_seen) {
 			client->first_data_seen = true;
 			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, on channel %u)\n",
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, on channel %u) hop_back=%d after_hop=%d\n",
 				 client->address,
 				 jiffies_to_msecs(jiffies - client->assoc_time),
 				 client->assoc_retries, client->hop_flips,
-				 dongle->mt.channel ? dongle->mt.channel->index : 0);
+				 dongle->mt.channel ? dongle->mt.channel->index : 0,
+				 client->hop_enabled, client->hop_armed);
 		}
 
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
@@ -1243,6 +1254,7 @@ static void xone_dongle_fw_load(struct work_struct *work)
 
 
 	for (int i = 0; i < 5; ++i) {
+		mt->fw_attempt = i + 1;
 		err = xone_mt76_load_firmware(mt, fw);
 		if (!err)
 			break;

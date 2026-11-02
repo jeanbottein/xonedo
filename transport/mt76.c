@@ -9,6 +9,7 @@
 #include <linux/usb.h>
 #include <linux/firmware.h>
 #include <linux/ieee80211.h>
+#include <linux/random.h>
 
 #include "mt76.h"
 
@@ -69,6 +70,37 @@ struct xone_mt76_msg_switch_channel {
 	u8 scan;
 	u8 unknown;
 } __packed;
+
+/*
+ * Test switches for the warm-start fixes, to measure which ones matter.
+ * 0 = off, 1 = on, 2 = random per warm start. Writable at runtime in
+ * /sys/module/xone_dongle/parameters/. Every firmware load logs the
+ * settings used and the outcome ("xone-fix: firmware load ..." line).
+ */
+static int fix_drain = 1;
+module_param(fix_drain, int, 0644);
+MODULE_PARM_DESC(fix_drain, "Warm start: stop RX and read out leftover data before the firmware upload (0=off, 1=on, 2=random)");
+
+static int fix_wlan_reset = 1;
+module_param(fix_wlan_reset, int, 0644);
+MODULE_PARM_DESC(fix_wlan_reset, "Warm start: reset and power up the WLAN block before the firmware upload (0=off, 1=on, 2=random)");
+
+bool xone_fix_pick(int setting)
+{
+	if (setting == 2)
+		return get_random_u32_below(2);
+
+	return setting != 0;
+}
+
+struct xone_mt76_load_info {
+	bool warm;
+	bool drain;
+	bool wlan_reset;
+	int packets;
+	int bytes;
+	u32 rx_pages;	/* RX page counter 0x0a30 at the warm start, before anything */
+};
 
 static char override_mac[ETH_ALEN] = { 0 };
 module_param_array(override_mac, byte, NULL, 0444);
@@ -686,19 +718,18 @@ static int xone_mt76_drain(struct xone_mt76 *mt, const char *when,
  * and nobody has read the RX endpoints since the driver went away. Stop RX/TX
  * (mainline mt76x2u_mac_stop()) and read out what the chip still holds.
  */
-static void xone_mt76_quiesce(struct xone_mt76 *mt)
+static void xone_mt76_quiesce(struct xone_mt76 *mt,
+			      struct xone_mt76_load_info *info)
 {
-	int bytes, packets;
-
 	xone_mt76_log_queues(mt, "warm");
 	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
 	msleep(20);
-	bytes = xone_mt76_drain(mt, "mac stopped", &packets);
+	info->bytes = xone_mt76_drain(mt, "mac stopped", &info->packets);
 
-	if (bytes)
+	if (info->bytes)
 		dev_info(mt->dev,
 			 "xone-fix: warm start: read out %d packets (%d bytes) of leftover radio data before the firmware upload\n",
-			 packets, bytes);
+			 info->packets, info->bytes);
 	else
 		dev_info(mt->dev,
 			 "xone-fix: warm start: no leftover radio data\n");
@@ -748,7 +779,9 @@ static int xone_mt76_reset_firmware(struct xone_mt76 *mt)
 	return 0;
 }
 
-int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
+static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
+				     const struct firmware *fw,
+				     struct xone_mt76_load_info *info)
 {
 	u32 val;
 	int err, i;
@@ -756,17 +789,30 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
-		xone_mt76_quiesce(mt);
+		info->warm = true;
+		info->rx_pages = xone_mt76_read_register(mt, 0x0a30);
+		info->drain = xone_fix_pick(fix_drain);
+		info->wlan_reset = xone_fix_pick(fix_wlan_reset);
 
-		err = xone_mt76_reset_wlan_hw(mt);
-		if (err)
-			return err;
+		if (info->drain) {
+			xone_mt76_quiesce(mt, info);
+		} else {
+			/* still measure what a drain would have found, without reading it */
+			xone_mt76_log_queues(mt, "warm, drain off");
+			info->packets = -1;
+		}
+
+		if (info->wlan_reset) {
+			err = xone_mt76_reset_wlan_hw(mt);
+			if (err)
+				return err;
+		}
 
 		err = xone_mt76_reset_firmware(mt);
 		if (err)
 			return err;
 
-		if (xone_mt76_drain(mt, "mcu reset", &i))
+		if (info->drain && xone_mt76_drain(mt, "mcu reset", &i))
 			dev_info(mt->dev,
 				 "xone-fix: warm start: more leftover data after the MCU reset (%d packets)\n",
 				 i);
@@ -820,6 +866,34 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (!xone_mt76_poll(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG, 0x01, 0x01))
 		err = -ETIMEDOUT;
+
+	return err;
+}
+
+int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
+{
+	struct xone_mt76_load_info info = {};
+	char leftover[24];
+	int err;
+
+	err = __xone_mt76_load_firmware(mt, fw, &info);
+
+	if (!info.warm) {
+		dev_info(mt->dev,
+			 "xone-fix: firmware load attempt %d: cold -> %s (%d)\n",
+			 mt->fw_attempt, err ? "FAILED" : "ok", err);
+		return err;
+	}
+
+	if (info.packets < 0)
+		strscpy(leftover, "not read", sizeof(leftover));
+	else
+		snprintf(leftover, sizeof(leftover), "%d pkts", info.packets);
+
+	dev_info(mt->dev,
+		 "xone-fix: firmware load attempt %d: warm drain=%d wlan_reset=%d rx_pages=0x%x leftover=%s -> %s (%d)\n",
+		 mt->fw_attempt, info.drain, info.wlan_reset, info.rx_pages,
+		 leftover, err ? "FAILED" : "ok", err);
 
 	return err;
 }
