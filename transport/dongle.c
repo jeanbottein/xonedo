@@ -146,11 +146,28 @@ static bool xone_dongle_wants_pairing_scan(struct xone_dongle *dongle)
 
 /*
  * A firmware session that ignores our writes was only ever cured by a USB
- * reset. At most once a minute, so this can't loop.
+ * reset. It drops every controller, so never while one is in use, and at
+ * most once a minute so it can't loop.
  */
 static bool xone_dongle_self_reset(struct xone_dongle *dongle,
 				   const char *why)
 {
+	unsigned long flags;
+	int i, in_use = 0;
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
+		if (dongle->clients[i] && dongle->clients[i]->first_data_seen)
+			in_use++;
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+
+	if (in_use) {
+		dev_warn(dongle->mt.dev,
+			 "xone-fix: %s: not resetting, %d controller(s) in use\n",
+			 why, in_use);
+		return false;
+	}
+
 	if (dongle->self_reset_time &&
 	    time_before(jiffies, dongle->self_reset_time + 60 * HZ))
 		return false;
