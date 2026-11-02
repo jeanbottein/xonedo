@@ -442,8 +442,13 @@ static int xone_mt76_send_firmware_part(struct xone_mt76 *mt, u32 offset,
 
 		complete = 0xc0000000 | (chunk_len << 16);
 		if (!xone_mt76_poll(mt, MT_FCE_DMA_LEN | MT_VEND_TYPE_CFG,
-				    0xffffffff, complete))
+				    0xffffffff, complete)) {
+			dev_err(mt->dev, "%s: chunk at 0x%x not done: DMA_LEN=0x%08x\n",
+				__func__, offset + pos,
+				xone_mt76_read_register(mt, MT_FCE_DMA_LEN |
+							MT_VEND_TYPE_CFG));
 			return -ETIMEDOUT;
+		}
 	}
 
 	return 0;
@@ -614,6 +619,56 @@ static int xone_mt76_wait_for_mac(struct xone_mt76 *mt)
 	return -ETIMEDOUT;
 }
 
+#define XONE_MT_DRAIN_LEN 0x10000
+
+/* read and drop what the chip still holds for the host on one endpoint */
+static int xone_mt76_drain_ep(struct xone_mt76 *mt, u8 ep, void *buf,
+			      int *packets)
+{
+	int i, err, actual, total = 0;
+
+	for (i = 0; i < 512; i++) {
+		actual = 0;
+		err = usb_bulk_msg(mt->udev, usb_rcvbulkpipe(mt->udev, ep),
+				   buf, XONE_MT_DRAIN_LEN, &actual, 20);
+		total += actual;
+		if (err)
+			break;
+	}
+
+	*packets += i;
+	return total;
+}
+
+/*
+ * A warm chip still has the old firmware receiving, and nobody read the RX
+ * endpoints since the driver went away: the leftover traffic made the
+ * firmware upload stall (FCE_DMA_LEN never done), after which the dongle
+ * stopped answering on USB until a replug. Stop RX/TX and read it out, as
+ * mainline mt76x2u_mac_stop() waits for the RX queues to drain.
+ */
+static void xone_mt76_quiesce(struct xone_mt76 *mt)
+{
+	int bytes, packets = 0;
+	void *buf;
+
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+	msleep(20);
+
+	buf = kmalloc(XONE_MT_DRAIN_LEN, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	bytes = xone_mt76_drain_ep(mt, XONE_MT_EP_IN_WLAN, buf, &packets);
+	bytes += xone_mt76_drain_ep(mt, XONE_MT_EP_IN_CMD, buf, &packets);
+	kfree(buf);
+
+	if (bytes)
+		dev_info(mt->dev,
+			 "%s: read out %d packets (%d bytes) left in the chip\n",
+			 __func__, packets, bytes);
+}
+
 /*
  * A warm chip keeps its RF state and BBP/PBF/FCE/TSO memories through an MCU
  * reset. MediaTek's reference driver and mainline mt76x2 reset them at every
@@ -656,6 +711,8 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
+		xone_mt76_quiesce(mt);
+
 		err = xone_mt76_reset_wlan_hw(mt);
 		if (err)
 			return err;
