@@ -1062,6 +1062,19 @@ static int xone_dongle_process_message(struct xone_dongle *dongle,
 	info = get_unaligned_le32(skb->data);
 	port = FIELD_GET(MT_RX_FCE_INFO_D_PORT, info);
 
+	/* debug: answers to numbered MCU commands (mainline: EVT_CMD_DONE etc.) */
+	if (port == MT_CPU_RX_PORT && FIELD_GET(MT_RX_FCE_INFO_CMD_SEQ, info) &&
+	    FIELD_GET(MT_RX_FCE_INFO_EVT_TYPE, info) <= 2) {
+		if (dongle->mt.mcu_raw_logged < 8) {
+			dongle->mt.mcu_raw_logged++;
+			dev_info(dongle->mt.dev,
+				 "xone-fix: MCU answer header 0x%08x (len %u)\n",
+				 info, skb->len);
+		}
+		xone_mt76_mcu_answer(&dongle->mt, info);
+		return 0;
+	}
+
 	/* ignore command reponses */
 	if (FIELD_GET(MT_RX_FCE_INFO_CMD_SEQ, info) == 0x01)
 		return 0;

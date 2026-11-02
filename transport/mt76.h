@@ -63,6 +63,15 @@ struct xone_mt76 {
 
 	/* debug: firmware load attempt number, for the xone-fix log line */
 	int fw_attempt;
+
+	/* debug: MCU command sequence numbers and the firmware's answers */
+	atomic_t mcu_seq;
+	atomic_t mcu_pending;	/* bit per seq: sent, not answered yet */
+	atomic_t mcu_inflight;	/* commands being sent right now */
+	u32 mcu_cmd[16];	/* command type per seq */
+	u8 mcu_last_seq;
+	unsigned int mcu_sent, mcu_answered, mcu_errors, mcu_lost, mcu_overlaps;
+	unsigned int mcu_raw_logged;
 };
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
@@ -72,6 +81,7 @@ int xone_mt76_set_led_mode(struct xone_mt76 *mt, enum xone_mt76_led_mode mode);
 int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw);
 void xone_mt76_stop_rx(struct xone_mt76 *mt);
 void xone_mt76_log_client_slots(struct xone_mt76 *mt);
+void xone_mt76_mcu_answer(struct xone_mt76 *mt, u32 info);
 int xone_mt76_init_radio(struct xone_mt76 *mt);
 int xone_mt76_suspend_radio(struct xone_mt76 *mt);
 int xone_mt76_resume_radio(struct xone_mt76 *mt);

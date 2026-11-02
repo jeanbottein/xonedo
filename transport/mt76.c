@@ -212,18 +212,77 @@ void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd)
 			       FIELD_PREP(MT_MCU_MSG_CMD_TYPE, cmd));
 }
 
+/*
+ * Debug experiment: number every MCU command (seq 1..15, like mainline
+ * __mt76x02u_mcu_send_msg()) so the firmware answers it, and track the
+ * answers (xone_mt76_mcu_answer()). Command type 0 (firmware upload chunks,
+ * client packets) keeps seq 0.
+ */
 static int xone_mt76_send_command(struct xone_mt76 *mt, struct sk_buff *skb,
 				  enum mt76_mcu_cmd cmd)
 {
-	int err;
+	int err, seq = 0;
 
-	xone_mt76_prep_command(skb, cmd);
+	if (cmd) {
+		do {
+			seq = atomic_inc_return(&mt->mcu_seq) & 0xf;
+		} while (!seq);
+
+		if (atomic_fetch_or(BIT(seq), &mt->mcu_pending) & BIT(seq)) {
+			mt->mcu_lost++;
+			dev_info_ratelimited(mt->dev,
+					     "xone-fix: MCU command %u (seq %d) never answered\n",
+					     mt->mcu_cmd[seq], seq);
+		}
+
+		mt->mcu_cmd[seq] = cmd;
+		mt->mcu_last_seq = seq;
+		mt->mcu_sent++;
+	}
+
+	if (atomic_inc_return(&mt->mcu_inflight) > 1) {
+		mt->mcu_overlaps++;
+		dev_info_ratelimited(mt->dev,
+				     "xone-fix: MCU command %u sent while another was being sent\n",
+				     cmd);
+	}
+
+	xone_mt76_prep_message(skb, MT_MCU_MSG_TYPE_CMD |
+			       FIELD_PREP(MT_MCU_MSG_PORT, MT_CPU_TX_PORT) |
+			       FIELD_PREP(MT_MCU_MSG_CMD_TYPE, cmd) |
+			       FIELD_PREP(MT_MCU_MSG_CMD_SEQ, seq));
 
 	err = usb_bulk_msg(mt->udev, usb_sndbulkpipe(mt->udev, XONE_MT_EP_OUT),
 			   skb->data, skb->len, NULL, XONE_MT_USB_TIMEOUT);
+	atomic_dec(&mt->mcu_inflight);
 	consume_skb(skb);
 
 	return err;
+}
+
+/* debug: an answer from the firmware to a numbered command */
+void xone_mt76_mcu_answer(struct xone_mt76 *mt, u32 info)
+{
+	u8 seq = FIELD_GET(MT_RX_FCE_INFO_CMD_SEQ, info);
+	u8 evt = FIELD_GET(MT_RX_FCE_INFO_EVT_TYPE, info);
+
+	atomic_andnot(BIT(seq), &mt->mcu_pending);
+	mt->mcu_answered++;
+
+	if (evt) {
+		mt->mcu_errors++;
+		dev_info_ratelimited(mt->dev,
+				     "xone-fix: MCU command %u (seq %d) answered with event %u (0 = done, 1 = error, 2 = retry)\n",
+				     mt->mcu_cmd[seq], seq, evt);
+	}
+}
+
+static void xone_mt76_log_mcu_stats(struct xone_mt76 *mt, const char *when)
+{
+	dev_info(mt->dev,
+		 "xone-fix: MCU stats (%s): sent %u, answered %u, error/retry %u, never answered %u, overlaps %u\n",
+		 when, mt->mcu_sent, mt->mcu_answered, mt->mcu_errors,
+		 mt->mcu_lost, mt->mcu_overlaps);
 }
 
 static int xone_mt76_send_wlan(struct xone_mt76 *mt, struct sk_buff *skb)
@@ -1521,7 +1580,9 @@ static bool xone_mt76_client_addr_is(struct xone_mt76 *mt, u8 wcid,
 static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
 				       u8 *addr)
 {
+	bool landed;
 	int try, i, err;
+	u8 seq;
 
 	for (try = 1; try <= 3; try++) {
 		err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr,
@@ -1529,15 +1590,27 @@ static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
 		if (err)
 			return err;
 
-		for (i = 0; i < 5; i++) {
-			if (xone_mt76_client_addr_is(mt, wcid, addr)) {
-				if (try > 1)
-					dev_info(mt->dev,
-						 "%s: wcid %d address landed on write %d\n",
-						 __func__, wcid, try);
-				return 0;
-			}
-			usleep_range(2000, 4000);
+		seq = mt->mcu_last_seq;
+		landed = false;
+		for (i = 0; i < 5 && !landed; i++) {
+			landed = xone_mt76_client_addr_is(mt, wcid, addr);
+			if (!landed)
+				usleep_range(2000, 4000);
+		}
+
+		dev_info(mt->dev,
+			 "xone-fix: wcid %d address write %d (seq %d): answered=%s landed=%s\n",
+			 wcid, try, seq,
+			 atomic_read(&mt->mcu_pending) & BIT(seq) ? "no" : "yes",
+			 landed ? "yes" : "no");
+		xone_mt76_log_mcu_stats(mt, "address write");
+
+		if (landed) {
+			if (try > 1)
+				dev_info(mt->dev,
+					 "%s: wcid %d address landed on write %d\n",
+					 __func__, wcid, try);
+			return 0;
 		}
 	}
 
