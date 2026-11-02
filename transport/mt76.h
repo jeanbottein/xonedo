@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <linux/completion.h>
+#include <linux/mutex.h>
+
 #include "mt76_defs.h"
 
 #define XONE_MT_EP_IN_CMD 0x05
@@ -60,13 +63,30 @@ struct xone_mt76 {
 
 	struct xone_mt76_channel channels[XONE_MT_NUM_CHANNELS];
 	struct xone_mt76_channel *channel;
+
+	/* numbered MCU commands and the firmware's answers */
+	struct mutex mcu_lock;
+	struct completion mcu_done;
+	bool mcu_answers;	/* command endpoint is being read */
+	u8 mcu_seq;
+	u8 mcu_wait_seq;
+	u8 mcu_evt;
 };
+
+/* MCU answer event types (mainline enum mcu_evt_type) */
+#define XONE_MT_EVT_CMD_DONE 0
+#define XONE_MT_EVT_CMD_ERROR 1
+#define XONE_MT_EVT_CMD_RETRY 2
+
+void xone_mt76_init_mcu(struct xone_mt76 *mt);
+void xone_mt76_mcu_answer(struct xone_mt76 *mt, u32 info);
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
 void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd);
 
 int xone_mt76_set_led_mode(struct xone_mt76 *mt, enum xone_mt76_led_mode mode);
 int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw);
+void xone_mt76_stop_rx(struct xone_mt76 *mt);
 int xone_mt76_init_radio(struct xone_mt76 *mt);
 int xone_mt76_suspend_radio(struct xone_mt76 *mt);
 int xone_mt76_resume_radio(struct xone_mt76 *mt);
