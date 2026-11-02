@@ -30,6 +30,10 @@ static int pairing_scan = 1;
 module_param(pairing_scan, int, 0644);
 MODULE_PARM_DESC(pairing_scan, "Pairing: hop channels every 2 s while waiting for a controller (added for the 02fe dongle; 0=off, 1=on)");
 
+static int fix_readd = 1;
+module_param(fix_readd, int, 0644);
+MODULE_PARM_DESC(fix_readd, "When a controller retries its association (missed our answer): remove it from the firmware and the chip and add it again, instead of only resending (0=off, 1=on, 2=random per controller)");
+
 static int fix_hop_back = 1;
 module_param(fix_hop_back, int, 0644);
 MODULE_PARM_DESC(fix_hop_back, "Pairing: switch back to the channel before the last hop when a controller retries its association (0=off, 1=on, 2=random per controller)");
@@ -77,6 +81,8 @@ struct xone_dongle_client {
 	/* associated within a scan interval of a hop; switch-back allowed */
 	bool hop_armed;
 	bool hop_enabled;
+	bool readd_enabled;
+	int readds;
 	/* connection timing, logged with the first data from the client */
 	unsigned long assoc_time;
 	int assoc_retries;
@@ -621,6 +627,21 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 			client->hop_flips++;
 		}
 
+		/*
+		 * Resending ADD_CLIENT for a client the firmware already has
+		 * did not get through (controller retried for minutes until a
+		 * USB reset). Start this client over: remove it from the
+		 * firmware and the WCID table, then add it again.
+		 */
+		if (client->readd_enabled) {
+			int rerr = xone_mt76_remove_client(&dongle->mt, i + 1);
+
+			client->readds++;
+			dev_info(dongle->mt.dev,
+				 "xone-fix: controller %pM: removed and added again in the chip (re-add %d): %d\n",
+				 addr, client->readds, rerr);
+		}
+
 		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
 	}
 
@@ -631,6 +652,7 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	client->assoc_time = jiffies;
 	client->hop_back_idx = XONE_DONGLE_HOP_NONE;
 	client->hop_enabled = xone_fix_pick(fix_hop_back);
+	client->readd_enabled = xone_fix_pick(fix_readd);
 	if (dongle->hop_prev_idx != XONE_DONGLE_HOP_NONE &&
 	    time_before(jiffies, dongle->hop_time + XONE_DONGLE_HOP_GRACE)) {
 		client->hop_armed = true;
@@ -827,12 +849,14 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		if (!client->first_data_seen) {
 			client->first_data_seen = true;
 			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, on channel %u) scan=%d hop_back=%d after_hop=%d\n",
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, re-adds %d, on channel %u) scan=%d readd=%d hop_back=%d after_hop=%d\n",
 				 client->address,
 				 jiffies_to_msecs(jiffies - client->assoc_time),
 				 client->assoc_retries, client->hop_flips,
+				 client->readds,
 				 dongle->mt.channel ? dongle->mt.channel->index : 0,
-				 pairing_scan, client->hop_enabled, client->hop_armed);
+				 pairing_scan, client->readd_enabled,
+				 client->hop_enabled, client->hop_armed);
 		}
 
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
