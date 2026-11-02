@@ -9,7 +9,6 @@
 #include <linux/usb.h>
 #include <linux/firmware.h>
 #include <linux/ieee80211.h>
-#include <linux/random.h>
 
 #include "mt76.h"
 
@@ -71,32 +70,9 @@ struct xone_mt76_msg_switch_channel {
 	u8 unknown;
 } __packed;
 
-/* test switches, to measure which fix matters: 0 = off, 1 = on, 2 = random */
-static int fix_drain = 1;
-module_param(fix_drain, int, 0644);
-MODULE_PARM_DESC(fix_drain, "Warm start: stop RX and read out leftover data before the firmware upload (0=off, 1=on, 2=random)");
-
-static int fix_wlan_reset = 1;
-module_param(fix_wlan_reset, int, 0644);
-MODULE_PARM_DESC(fix_wlan_reset, "Warm start: reset and power up the WLAN block before the firmware upload (0=off, 1=on, 2=random)");
-
-static int fix_wcid_reset = 1;
-module_param(fix_wcid_reset, int, 0644);
-MODULE_PARM_DESC(fix_wcid_reset, "At every radio init: clear client slots (address, key) left in the chip from before (0=off, 1=on, 2=random)");
-
-bool xone_fix_pick(int setting)
-{
-	if (setting == 2)
-		return get_random_u32() & 1;
-
-	return setting != 0;
-}
-
 struct xone_mt76_load_info {
 	bool warm;
-	bool drain;
-	bool wlan_reset;
-	int packets;	/* read out by the drain, -1 if the drain was off */
+	int packets;	/* leftover data read out before the upload */
 	int bytes;
 	u32 rx_pages;	/* RX page counter at the warm start */
 };
@@ -780,19 +756,11 @@ static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
 		info->warm = true;
 		info->rx_pages = xone_mt76_read_register(mt, 0x0a30);
-		info->drain = xone_fix_pick(fix_drain);
-		info->wlan_reset = xone_fix_pick(fix_wlan_reset);
+		xone_mt76_quiesce(mt, info);
 
-		if (info->drain)
-			xone_mt76_quiesce(mt, info);
-		else
-			info->packets = -1;
-
-		if (info->wlan_reset) {
-			err = xone_mt76_reset_wlan_hw(mt);
-			if (err)
-				return err;
-		}
+		err = xone_mt76_reset_wlan_hw(mt);
+		if (err)
+			return err;
 
 		err = xone_mt76_reset_firmware(mt);
 		if (err)
@@ -859,9 +827,9 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (info.warm)
 		dev_info(mt->dev,
-			 "xone-fix: firmware load attempt %d: warm drain=%d wlan_reset=%d rx_pages=0x%x leftover=%d pkts -> %s (%d)\n",
-			 mt->fw_attempt, info.drain, info.wlan_reset,
-			 info.rx_pages, info.packets, err ? "FAILED" : "ok", err);
+			 "xone-fix: firmware load attempt %d: warm rx_pages=0x%x leftover=%d pkts -> %s (%d)\n",
+			 mt->fw_attempt, info.rx_pages, info.packets,
+			 err ? "FAILED" : "ok", err);
 	else
 		dev_info(mt->dev,
 			 "xone-fix: firmware load attempt %d: cold -> %s (%d)\n",
@@ -1300,18 +1268,14 @@ static void xone_mt76_reset_client_slots(struct xone_mt76 *mt, int keys,
 {
 	u8 addr[8] = {}, iv[8] = {}, key[XONE_MT_WCID_KEY_LEN] = {};
 	__le32 attr = 0;
-	bool clear;
 	int i;
 
 	if (!keys && !addrs)
 		return;
 
-	clear = xone_fix_pick(fix_wcid_reset);
 	dev_info(mt->dev,
-		 "xone-fix: radio init: client slots left from before: %d with key, %d with address: %s\n",
-		 keys, addrs, clear ? "cleared" : "kept (fix_wcid_reset off)");
-	if (!clear)
-		return;
+		 "xone-fix: radio init: client slots left from before: %d with key, %d with address: cleared\n",
+		 keys, addrs);
 
 	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
 		xone_mt76_write_burst(mt, MT_WCID_ATTR(i), &attr, sizeof(attr));

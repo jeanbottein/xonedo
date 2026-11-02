@@ -65,8 +65,6 @@ struct xone_mt76 {
 	int fw_attempt;
 };
 
-/* test switches: 0 = off, 1 = on, 2 = random each time it applies */
-bool xone_fix_pick(int setting);
 void xone_mt76_stop_rx(struct xone_mt76 *mt);
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);

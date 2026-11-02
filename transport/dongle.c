@@ -22,22 +22,6 @@ ushort fw_override_pid = 0;
 MODULE_PARM_DESC(fw_override, "Use firmware for the provided product ID instead of the one detected automatically");
 module_param_named(fw_override, fw_override_pid, ushort, 0600);
 
-static int fix_stop_on_unload = 1;
-module_param(fix_stop_on_unload, int, 0644);
-MODULE_PARM_DESC(fix_stop_on_unload, "Driver unload/shutdown: stop the radio receiving, so traffic doesn't pile up in the chip for the next start (0=off, 1=on, 2=random)");
-
-static int pairing_scan = 1;
-module_param(pairing_scan, int, 0644);
-MODULE_PARM_DESC(pairing_scan, "Pairing: hop channels every 2 s while waiting for a controller (added for the 02fe dongle; 0=off, 1=on)");
-
-static int fix_readd = 1;
-module_param(fix_readd, int, 0644);
-MODULE_PARM_DESC(fix_readd, "When a controller retries its association (missed our answer): remove it from the firmware and the chip and add it again, instead of only resending (0=off, 1=on, 2=random per controller)");
-
-static int fix_hop_back = 1;
-module_param(fix_hop_back, int, 0644);
-MODULE_PARM_DESC(fix_hop_back, "Pairing: switch back to the channel before the last hop when a controller retries its association (0=off, 1=on, 2=random per controller)");
-
 #define XONE_DONGLE_NUM_IN_URBS 12
 #define XONE_DONGLE_NUM_OUT_URBS 12
 
@@ -75,13 +59,6 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
-	/* association retries: hop-back (other channel to try) and re-add */
-	u8 hop_back_idx;
-	int hop_flips;
-	bool hop_armed;
-	bool hop_enabled;
-	bool readd_enabled;
-	int readds;
 	/* logged with the client's first data */
 	unsigned long assoc_time;
 	int assoc_retries;
@@ -123,9 +100,6 @@ struct xone_dongle {
 	bool pairing;
 	unsigned long last_wlan_rx;
 	u8 pairing_scan_idx;
-	/* last pairing-scan hop: channel before it and when */
-	unsigned long hop_time;
-	u8 hop_prev_idx;
 
 	/* serializes access to clients array */
 	spinlock_t clients_lock;
@@ -157,25 +131,14 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 	return 0;
 }
 
-#define XONE_DONGLE_HOP_NONE 0xff
-/* a controller can take up to one scan interval to answer a beacon */
-#define XONE_DONGLE_HOP_GRACE XONE_DONGLE_PAIR_SCAN_INTERVAL
-#define XONE_DONGLE_HOP_MAX_FLIPS 4
-
 /*
- * After a pairing-scan hop the dongle still hears a controller on the
- * previous channel (40/80 MHz channels overlap) but answers on the new one.
+ * The pairing channel scan (dlundqvist/xone#168) was added for the 02fe
+ * dongle. On 02e6, which never needed it (xow), controllers connect in 4-5 s
+ * without it instead of 10-15 s.
  */
-static void xone_dongle_hop_back(struct xone_dongle *dongle, u8 idx)
+static bool xone_dongle_wants_pairing_scan(struct xone_dongle *dongle)
 {
-	struct xone_mt76_channel *chan = &dongle->mt.channels[idx];
-
-	mutex_lock(&dongle->pairing_lock);
-	if (!xone_mt76_switch_channel(&dongle->mt, chan)) {
-		dongle->mt.channel = chan;
-		dongle->pairing_scan_idx = idx;
-	}
-	mutex_unlock(&dongle->pairing_lock);
+	return dongle->product != 0x02e6;
 }
 
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
@@ -334,11 +297,11 @@ static int xone_dongle_pairing_handler(struct xone_dongle *dongle, bool enable,
 	if (enable) {
 		dongle->last_wlan_rx = jiffies;
 		dongle->pairing_scan_idx = xone_dongle_find_channel_idx(dongle);
-		dongle->hop_prev_idx = XONE_DONGLE_HOP_NONE;
 		mod_delayed_work(system_wq, &dongle->pairing_work,
 				 msecs_to_jiffies(timeout_secs * 1000));
-		mod_delayed_work(system_wq, &dongle->pairing_scan_work,
-				 XONE_DONGLE_PAIR_SCAN_INTERVAL);
+		if (xone_dongle_wants_pairing_scan(dongle))
+			mod_delayed_work(system_wq, &dongle->pairing_scan_work,
+					 XONE_DONGLE_PAIR_SCAN_INTERVAL);
 	} else {
 		cancel_delayed_work(&dongle->pairing_scan_work);
 	}
@@ -387,9 +350,6 @@ static void xone_dongle_pairing_scan(struct work_struct *work)
 	if (!dongle->pairing)
 		goto out_unlock;
 
-	if (!pairing_scan)
-		goto out_resched;
-
 	/*
 	 * Once a controller has sent an association request the dongle and
 	 * controller are both on the same channel. Switching channels while
@@ -424,9 +384,6 @@ static void xone_dongle_pairing_scan(struct work_struct *work)
 		dev_dbg(dongle->mt.dev,
 			"%s: channel switch %u -> %u\n",
 			__func__, prev_chan, next_chan);
-
-		dongle->hop_prev_idx = dongle->pairing_scan_idx;
-		dongle->hop_time = jiffies;
 	}
 
 	dongle->pairing_scan_idx = next_idx;
@@ -590,37 +547,19 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 
 		client->assoc_retries++;
 		dev_info(dongle->mt.dev,
-			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request): answer resent\n",
+			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request): removed and added again\n",
 			 addr, client->assoc_retries,
 			 jiffies_to_msecs(jiffies - client->assoc_time));
 
-		/* associated right after a hop: alternate between the two channels */
-		if (client->hop_back_idx != XONE_DONGLE_HOP_NONE &&
-		    client->hop_enabled &&
-		    client->hop_flips < XONE_DONGLE_HOP_MAX_FLIPS) {
-			u8 cur_idx = xone_dongle_find_channel_idx(dongle);
-
-			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM: it connected right after a channel hop, switching to channel %u\n",
-				 addr,
-				 dongle->mt.channels[client->hop_back_idx].index);
-			xone_dongle_hop_back(dongle, client->hop_back_idx);
-			client->hop_back_idx = cur_idx;
-			client->hop_flips++;
-		}
-
 		/*
 		 * Resending ADD_CLIENT for a client the firmware already has
-		 * never got through (retries for minutes, until a USB reset).
+		 * never got through (retries for minutes, until a USB reset):
+		 * remove it from the firmware and the WCID table first.
 		 */
-		if (client->readd_enabled) {
-			int rerr = xone_mt76_remove_client(&dongle->mt, i + 1);
-
-			client->readds++;
-			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM: removed and added again in the chip (re-add %d): %d\n",
-				 addr, client->readds, rerr);
-		}
+		err = xone_mt76_remove_client(&dongle->mt, i + 1);
+		if (err)
+			dev_err(dongle->mt.dev, "%s: remove client failed: %d\n",
+				__func__, err);
 
 		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
 	}
@@ -630,19 +569,6 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 		return PTR_ERR(client);
 
 	client->assoc_time = jiffies;
-	client->hop_back_idx = XONE_DONGLE_HOP_NONE;
-	client->hop_enabled = xone_fix_pick(fix_hop_back);
-	client->readd_enabled = xone_fix_pick(fix_readd);
-	if (dongle->hop_prev_idx != XONE_DONGLE_HOP_NONE &&
-	    time_before(jiffies, dongle->hop_time + XONE_DONGLE_HOP_GRACE)) {
-		client->hop_armed = true;
-		client->hop_back_idx = dongle->hop_prev_idx;
-		dev_info(dongle->mt.dev,
-			 "xone-fix: controller %pM connected %u ms after a channel hop %u -> %u (it may miss our answer; will switch if it retries)\n",
-			 addr, jiffies_to_msecs(jiffies - dongle->hop_time),
-			 dongle->mt.channels[client->hop_back_idx].index,
-			 dongle->mt.channel ? dongle->mt.channel->index : 0);
-	}
 
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
 	if (err)
@@ -829,14 +755,11 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		if (!client->first_data_seen) {
 			client->first_data_seen = true;
 			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, re-adds %d, on channel %u) scan=%d readd=%d hop_back=%d after_hop=%d\n",
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, on channel %u)\n",
 				 client->address,
 				 jiffies_to_msecs(jiffies - client->assoc_time),
-				 client->assoc_retries, client->hop_flips,
-				 client->readds,
-				 dongle->mt.channel ? dongle->mt.channel->index : 0,
-				 pairing_scan, client->readd_enabled,
-				 client->hop_enabled, client->hop_armed);
+				 client->assoc_retries,
+				 dongle->mt.channel ? dongle->mt.channel->index : 0);
 		}
 
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
@@ -1383,13 +1306,6 @@ static void xone_dongle_stop_on_unload(struct xone_dongle *dongle,
 	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY ||
 	    dongle->mt.udev->state == USB_STATE_NOTATTACHED)
 		return;
-
-	if (!xone_fix_pick(fix_stop_on_unload)) {
-		dev_info(dongle->mt.dev,
-			 "xone-fix: %s: radio left receiving (fix_stop_on_unload off)\n",
-			 when);
-		return;
-	}
 
 	xone_mt76_stop_rx(&dongle->mt);
 	dev_info(dongle->mt.dev, "xone-fix: %s: radio receive stopped\n", when);
