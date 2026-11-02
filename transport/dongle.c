@@ -59,6 +59,10 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
+	/* debug */
+	unsigned long assoc_time;
+	int assoc_retries;
+	bool connected;
 
 	struct gip_adapter *adapter;
 };
@@ -536,15 +540,27 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	 * because our association response got lost, so send it again
 	 * instead of allocating a second slot.
 	 */
-	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
-		if (dongle->clients[i] &&
-		    ether_addr_equal(dongle->clients[i]->address, addr))
-			return xone_mt76_associate_client(&dongle->mt,
-							  i + 1, addr);
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		client = dongle->clients[i];
+		if (!client || !ether_addr_equal(client->address, addr))
+			continue;
+
+		dev_info(dongle->mt.dev,
+			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request)\n",
+			 addr, ++client->assoc_retries,
+			 jiffies_to_msecs(jiffies - client->assoc_time));
+		if (client->assoc_retries == 1)
+			xone_mt76_log_client_slots(&dongle->mt);
+		xone_mt76_log_mcu_stats(&dongle->mt, "retry");
+
+		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
+	}
 
 	client = xone_dongle_create_client(dongle, addr);
 	if (IS_ERR(client))
 		return PTR_ERR(client);
+
+	client->assoc_time = jiffies;
 
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
 	if (err)
@@ -727,6 +743,17 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		 */
 		if (dongle->pairing)
 			dongle->last_wlan_rx = jiffies;
+		if (!client->connected) {
+			client->connected = true;
+			dev_info(dongle->mt.dev,
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, on channel %u)\n",
+				 client->address,
+				 jiffies_to_msecs(jiffies - client->assoc_time),
+				 client->assoc_retries,
+				 dongle->mt.channel ? dongle->mt.channel->index : 0);
+			xone_mt76_log_mcu_stats(&dongle->mt, "connected");
+		}
+
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
 	}
 
@@ -850,6 +877,42 @@ static int xone_dongle_handle_loss(struct xone_dongle *dongle,
 	return xone_dongle_handle_disassociation(dongle, wcid);
 }
 
+/*
+ * Debug: frames from one of our controllers that the chip did not match to
+ * its WCID (0xff or a free slot) and that xone drops silently: the signature
+ * of a client address that never reached the WCID table.
+ */
+static void xone_dongle_log_dropped(struct xone_dongle *dongle,
+				    struct ieee80211_hdr_3addr *hdr, u16 type,
+				    u8 wcid)
+{
+	u16 kind = type & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE);
+	unsigned long flags;
+	int i;
+
+	switch (kind) {
+	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ASSOC_REQ:
+	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DISASSOC:
+	case IEEE80211_FTYPE_MGMT | XONE_MT_WLAN_RESERVED:
+		return;
+	}
+
+	if (wcid && wcid <= XONE_DONGLE_MAX_CLIENTS && dongle->clients[wcid - 1])
+		return;
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		if (dongle->clients[i] &&
+		    ether_addr_equal(dongle->clients[i]->address, hdr->addr2)) {
+			dev_info_ratelimited(dongle->mt.dev,
+					     "xone-fix: dropped frame from controller %pM: type 0x%04x, chip slot %u (driver slot %d)\n",
+					     hdr->addr2, kind, wcid, i + 1);
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+}
+
 static int xone_dongle_process_frame(struct xone_dongle *dongle,
 				     struct sk_buff *skb,
 				     unsigned int hdr_len, u8 wcid)
@@ -872,6 +935,8 @@ static int xone_dongle_process_frame(struct xone_dongle *dongle,
 
 	skb_pull(skb, hdr_len);
 	type = le16_to_cpu(hdr->frame_control);
+
+	xone_dongle_log_dropped(dongle, hdr, type, wcid);
 
 	switch (type & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE)) {
 	case IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA:
@@ -1164,9 +1229,12 @@ static void xone_dongle_fw_load(struct work_struct *work)
 
 
 	for (int i = 0; i < 5; ++i) {
+		mt->fw_attempt = i + 1;
 		err = xone_mt76_load_firmware(mt, fw);
 		if (!err)
 			break;
+		dev_warn(mt->dev, "xone-fix: firmware load attempt %d failed: %d\n",
+			 i + 1, err);
 		ssleep(1);
 	}
 	release_firmware(fw);
@@ -1279,6 +1347,7 @@ static void xone_dongle_stop_rx(struct xone_dongle *dongle)
 		return;
 
 	xone_mt76_stop_rx(&dongle->mt);
+	dev_info(dongle->mt.dev, "xone-fix: unload: radio receive stopped\n");
 }
 
 static int xone_dongle_power_off_clients(struct xone_dongle *dongle)

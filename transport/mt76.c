@@ -244,7 +244,11 @@ static int xone_mt76_send_confirmed(struct xone_mt76 *mt, struct sk_buff *skb,
 	int try, err = 0;
 	u8 seq;
 
+	mt->mcu_sent++;
 	for (try = 1; try <= XONE_MT_MCU_TRIES; try++) {
+		if (try > 1)
+			mt->mcu_resent++;
+
 		msg = skb_copy(skb, GFP_KERNEL);
 		if (!msg)
 			return -ENOMEM;
@@ -286,8 +290,18 @@ static int xone_mt76_send_confirmed(struct xone_mt76 *mt, struct sk_buff *skb,
 	}
 
 	WRITE_ONCE(mt->mcu_wait_seq, 0);
+	if (err)
+		mt->mcu_failed++;
 
 	return err;
+}
+
+/* debug */
+void xone_mt76_log_mcu_stats(struct xone_mt76 *mt, const char *when)
+{
+	dev_info(mt->dev,
+		 "xone-fix: confirmed commands (%s): sent %u, resent %u, failed %u\n",
+		 when, mt->mcu_sent, mt->mcu_resent, mt->mcu_failed);
 }
 
 static int xone_mt76_send_command(struct xone_mt76 *mt, struct sk_buff *skb,
@@ -734,7 +748,7 @@ static int xone_mt76_drain_ep(struct xone_mt76 *mt, u8 ep, void *buf,
  * stopped answering on USB until a replug. Stop RX/TX and read it out, as
  * mainline mt76x2u_mac_stop() waits for the RX queues to drain.
  */
-static void xone_mt76_quiesce(struct xone_mt76 *mt)
+static int xone_mt76_quiesce(struct xone_mt76 *mt)
 {
 	int bytes, packets = 0;
 	void *buf;
@@ -744,7 +758,7 @@ static void xone_mt76_quiesce(struct xone_mt76 *mt)
 
 	buf = kmalloc(XONE_MT_DRAIN_LEN, GFP_KERNEL);
 	if (!buf)
-		return;
+		return 0;
 
 	bytes = xone_mt76_drain_ep(mt, XONE_MT_EP_IN_WLAN, buf, &packets);
 	bytes += xone_mt76_drain_ep(mt, XONE_MT_EP_IN_CMD, buf, &packets);
@@ -752,8 +766,12 @@ static void xone_mt76_quiesce(struct xone_mt76 *mt)
 
 	if (bytes)
 		dev_info(mt->dev,
-			 "%s: read out %d packets (%d bytes) left in the chip\n",
-			 __func__, packets, bytes);
+			 "xone-fix: warm start: read out %d packets (%d bytes) of leftover radio data before the firmware upload\n",
+			 packets, bytes);
+	else
+		dev_info(mt->dev, "xone-fix: warm start: no leftover radio data\n");
+
+	return packets;
 }
 
 /*
@@ -791,14 +809,17 @@ static int xone_mt76_reset_firmware(struct xone_mt76 *mt)
 	return 0;
 }
 
-int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
+static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
+				     const struct firmware *fw, bool *warm,
+				     int *leftover)
 {
 	u32 val;
 	int err;
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
-		xone_mt76_quiesce(mt);
+		*warm = true;
+		*leftover = xone_mt76_quiesce(mt);
 
 		err = xone_mt76_reset_wlan_hw(mt);
 		if (err)
@@ -850,6 +871,25 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (!xone_mt76_poll(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG, 0x01, 0x01))
 		err = -ETIMEDOUT;
+
+	return err;
+}
+
+/* debug: one xone-fix line per firmware load */
+int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
+{
+	bool warm = false;
+	int leftover = 0, err;
+
+	err = __xone_mt76_load_firmware(mt, fw, &warm, &leftover);
+
+	if (warm && !err)
+		dev_info(mt->dev, "xone-fix: warm start: fresh firmware uploaded\n");
+
+	dev_info(mt->dev,
+		 "xone-fix: firmware load attempt %d: %s leftover=%d pkts -> %s (%d)\n",
+		 mt->fw_attempt, warm ? "warm" : "cold", leftover,
+		 err ? "FAILED" : "ok", err);
 
 	return err;
 }
@@ -1284,14 +1324,35 @@ static void xone_mt76_reset_client_slots(struct xone_mt76 *mt, int keys,
 	if (!keys && !addrs)
 		return;
 
-	dev_dbg(mt->dev, "%s: %d slots with a key, %d with an address\n",
-		__func__, keys, addrs);
+	dev_info(mt->dev,
+		 "xone-fix: radio init: client slots left from before: %d with key, %d with address: cleared\n",
+		 keys, addrs);
 
 	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
 		xone_mt76_write_burst(mt, MT_WCID_ATTR(i), &attr, sizeof(attr));
 		xone_mt76_write_burst(mt, MT_WCID_KEY(i), key, sizeof(key));
 		xone_mt76_write_burst(mt, MT_WCID_IV(i), iv, sizeof(iv));
 		xone_mt76_write_burst(mt, MT_WCID_ADDR(i), addr, sizeof(addr));
+	}
+}
+
+/* debug: which WCID slots hold an address, and their attributes */
+void xone_mt76_log_client_slots(struct xone_mt76 *mt)
+{
+	u32 lo, hi;
+	int i;
+
+	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
+		lo = xone_mt76_read_register(mt, MT_WCID_ADDR(i));
+		hi = xone_mt76_read_register(mt, MT_WCID_ADDR(i) + 4) & 0xffff;
+		if (!lo && !hi)
+			continue;
+
+		dev_info(mt->dev,
+			 "xone-fix: chip slot %d: address %02x:%02x:%02x:%02x:%02x:%02x attr=0x%08x\n",
+			 i, lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff,
+			 lo >> 24, hi & 0xff, hi >> 8,
+			 xone_mt76_read_register(mt, MT_WCID_ATTR(i)));
 	}
 }
 
