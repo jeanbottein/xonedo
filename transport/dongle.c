@@ -75,15 +75,14 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
-	/* other channel to try if this client retries (before/after a hop) */
+	/* association retries: hop-back (other channel to try) and re-add */
 	u8 hop_back_idx;
 	int hop_flips;
-	/* associated within a scan interval of a hop; switch-back allowed */
 	bool hop_armed;
 	bool hop_enabled;
 	bool readd_enabled;
 	int readds;
-	/* connection timing, logged with the first data from the client */
+	/* logged with the client's first data */
 	unsigned long assoc_time;
 	int assoc_retries;
 	bool first_data_seen;
@@ -164,28 +163,19 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 #define XONE_DONGLE_HOP_MAX_FLIPS 4
 
 /*
- * The dongle hears a controller on the channel it just left (the 40/80 MHz
- * channels overlap: xone uses 40 with 44, for example), but answers on the
- * new one, which the controller never hears. A controller that sends its
- * association request shortly after a hop is most likely still on the
- * previous channel.
+ * After a pairing-scan hop the dongle still hears a controller on the
+ * previous channel (40/80 MHz channels overlap) but answers on the new one.
  */
 static void xone_dongle_hop_back(struct xone_dongle *dongle, u8 idx)
 {
 	struct xone_mt76_channel *chan = &dongle->mt.channels[idx];
-	int err;
 
 	mutex_lock(&dongle->pairing_lock);
-	err = xone_mt76_switch_channel(&dongle->mt, chan);
-	if (!err) {
+	if (!xone_mt76_switch_channel(&dongle->mt, chan)) {
 		dongle->mt.channel = chan;
 		dongle->pairing_scan_idx = idx;
 	}
 	mutex_unlock(&dongle->pairing_lock);
-
-	dev_dbg(dongle->mt.dev,
-		"%s: client retried right after a hop, back to channel %u: %d\n",
-		__func__, chan->index, err);
 }
 
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
@@ -590,29 +580,21 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 
 	/*
 	 * Controller already has a WCID slot: it retransmits its request
-	 * because our association response got lost, so send it again
-	 * instead of allocating a second slot.
+	 * because it missed our association response. Answer again in the
+	 * same slot instead of allocating a second one.
 	 */
 	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
 		client = dongle->clients[i];
 		if (!client || !ether_addr_equal(client->address, addr))
 			continue;
 
-		/*
-		 * It associated right after a hop inside a wide channel and
-		 * missed our response: it is still on the previous primary
-		 * channel. Go back there once.
-		 */
 		client->assoc_retries++;
 		dev_info(dongle->mt.dev,
 			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request): answer resent\n",
 			 addr, client->assoc_retries,
 			 jiffies_to_msecs(jiffies - client->assoc_time));
 
-		/*
-		 * Try the other channel of the pair on each retry: the
-		 * previous one first, back again if that was the wrong guess.
-		 */
+		/* associated right after a hop: alternate between the two channels */
 		if (client->hop_back_idx != XONE_DONGLE_HOP_NONE &&
 		    client->hop_enabled &&
 		    client->hop_flips < XONE_DONGLE_HOP_MAX_FLIPS) {
@@ -629,9 +611,7 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 
 		/*
 		 * Resending ADD_CLIENT for a client the firmware already has
-		 * did not get through (controller retried for minutes until a
-		 * USB reset). Start this client over: remove it from the
-		 * firmware and the WCID table, then add it again.
+		 * never got through (retries for minutes, until a USB reset).
 		 */
 		if (client->readd_enabled) {
 			int rerr = xone_mt76_remove_client(&dongle->mt, i + 1);
@@ -1394,9 +1374,8 @@ static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index,
 }
 
 /*
- * Mainline mt76x2u stops the MAC on cleanup; xone left it receiving, so with
- * USB power kept on, controller traffic piled up in the chip until the next
- * firmware load (which then could stall). Not on a physical unplug.
+ * Mainline stops the MAC on cleanup. Left receiving, a chip that keeps USB
+ * power piles up controller traffic until the next firmware load.
  */
 static void xone_dongle_stop_on_unload(struct xone_dongle *dongle,
 				       const char *when)

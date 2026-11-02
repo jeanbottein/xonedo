@@ -71,12 +71,7 @@ struct xone_mt76_msg_switch_channel {
 	u8 unknown;
 } __packed;
 
-/*
- * Test switches for the warm-start fixes, to measure which ones matter.
- * 0 = off, 1 = on, 2 = random per warm start. Writable at runtime in
- * /sys/module/xone_dongle/parameters/. Every firmware load logs the
- * settings used and the outcome ("xone-fix: firmware load ..." line).
- */
+/* test switches, to measure which fix matters: 0 = off, 1 = on, 2 = random */
 static int fix_drain = 1;
 module_param(fix_drain, int, 0644);
 MODULE_PARM_DESC(fix_drain, "Warm start: stop RX and read out leftover data before the firmware upload (0=off, 1=on, 2=random)");
@@ -92,7 +87,7 @@ MODULE_PARM_DESC(fix_wcid_reset, "At every radio init: clear client slots (addre
 bool xone_fix_pick(int setting)
 {
 	if (setting == 2)
-		return get_random_u32_below(2);
+		return get_random_u32() & 1;
 
 	return setting != 0;
 }
@@ -101,9 +96,9 @@ struct xone_mt76_load_info {
 	bool warm;
 	bool drain;
 	bool wlan_reset;
-	int packets;
+	int packets;	/* read out by the drain, -1 if the drain was off */
 	int bytes;
-	u32 rx_pages;	/* RX page counter 0x0a30 at the warm start, before anything */
+	u32 rx_pages;	/* RX page counter at the warm start */
 };
 
 static char override_mac[ETH_ALEN] = { 0 };
@@ -718,9 +713,9 @@ static int xone_mt76_drain(struct xone_mt76 *mt, const char *when,
 }
 
 /*
- * On a warm chip the old firmware is still running with the MAC receiving,
- * and nobody has read the RX endpoints since the driver went away. Stop RX/TX
- * (mainline mt76x2u_mac_stop()) and read out what the chip still holds.
+ * A warm chip still has the old firmware receiving, and nobody read the RX
+ * endpoints since the driver went away: the leftover traffic made the
+ * firmware upload stall. Stop RX/TX and read it out.
  */
 static void xone_mt76_quiesce(struct xone_mt76 *mt,
 			      struct xone_mt76_load_info *info)
@@ -740,19 +735,10 @@ static void xone_mt76_quiesce(struct xone_mt76 *mt,
 }
 
 /*
- * Put the WLAN block back to its power-on state before a warm firmware load.
- *
- * A warm chip (USB power never cut: reboot, resume, driver reload) keeps its RF
- * state and its BBP/PBF/FCE/TSO memories through an MCU reset. MediaTek's
- * reference driver resets them at every start ("Restore all HW default value
- * and reset RF", rlt_wlan_chip_onoff() + mt76x2_pwrOn()), and mainline mt76x2
- * has done the same since its first version (PCIe 7bc04215a66b, USB
- * ee676cd5017c), at every probe and every resume: mt76x2u_init_hardware(),
- * mt76x2_resume_device(). xone was written from captures of a cold start,
- * where this step is a no-op, so it never had it.
- *
- * On its own it did not cure the warm-load upload stalls (the RX drain did),
- * but it is the vendor's procedure for exactly this case, so keep it.
+ * A warm chip keeps its RF state and BBP/PBF/FCE/TSO memories through an MCU
+ * reset. MediaTek's reference driver and mainline mt76x2 reset them at every
+ * probe and resume (mt76x2u_init_hardware()); xone, written from captures of
+ * a cold start, never did.
  */
 static int xone_mt76_reset_wlan_hw(struct xone_mt76 *mt)
 {
@@ -788,8 +774,7 @@ static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
 				     struct xone_mt76_load_info *info)
 {
 	u32 val;
-	int err, i;
-	bool warm = false;
+	int err;
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
@@ -798,13 +783,10 @@ static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
 		info->drain = xone_fix_pick(fix_drain);
 		info->wlan_reset = xone_fix_pick(fix_wlan_reset);
 
-		if (info->drain) {
+		if (info->drain)
 			xone_mt76_quiesce(mt, info);
-		} else {
-			/* still measure what a drain would have found, without reading it */
-			xone_mt76_log_queues(mt, "warm, drain off");
+		else
 			info->packets = -1;
-		}
 
 		if (info->wlan_reset) {
 			err = xone_mt76_reset_wlan_hw(mt);
@@ -815,12 +797,6 @@ static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
 		err = xone_mt76_reset_firmware(mt);
 		if (err)
 			return err;
-
-		if (info->drain && xone_mt76_drain(mt, "mcu reset", &i))
-			dev_info(mt->dev,
-				 "xone-fix: warm start: more leftover data after the MCU reset (%d packets)\n",
-				 i);
-		warm = true;
 	}
 
 	dev_dbg(mt->dev, "%s: loading firmware...\n", __func__);
@@ -851,7 +827,7 @@ static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
 	if (err)
 		return err;
 
-	if (warm)
+	if (info->warm)
 		dev_info(mt->dev,
 			 "xone-fix: warm start: fresh firmware uploaded\n");
 
@@ -877,27 +853,19 @@ static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
 int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 {
 	struct xone_mt76_load_info info = {};
-	char leftover[24];
 	int err;
 
 	err = __xone_mt76_load_firmware(mt, fw, &info);
 
-	if (!info.warm) {
+	if (info.warm)
+		dev_info(mt->dev,
+			 "xone-fix: firmware load attempt %d: warm drain=%d wlan_reset=%d rx_pages=0x%x leftover=%d pkts -> %s (%d)\n",
+			 mt->fw_attempt, info.drain, info.wlan_reset,
+			 info.rx_pages, info.packets, err ? "FAILED" : "ok", err);
+	else
 		dev_info(mt->dev,
 			 "xone-fix: firmware load attempt %d: cold -> %s (%d)\n",
 			 mt->fw_attempt, err ? "FAILED" : "ok", err);
-		return err;
-	}
-
-	if (info.packets < 0)
-		strscpy(leftover, "not read", sizeof(leftover));
-	else
-		snprintf(leftover, sizeof(leftover), "%d pkts", info.packets);
-
-	dev_info(mt->dev,
-		 "xone-fix: firmware load attempt %d: warm drain=%d wlan_reset=%d rx_pages=0x%x leftover=%s -> %s (%d)\n",
-		 mt->fw_attempt, info.drain, info.wlan_reset, info.rx_pages,
-		 leftover, err ? "FAILED" : "ok", err);
 
 	return err;
 }
@@ -1295,7 +1263,6 @@ static u16 xone_mt76_get_chip_id(struct xone_mt76 *mt)
 	return (id[1] << 8) | id[2];
 }
 
-/* stop receiving (like mainline mt76x2u_mac_stop() on cleanup) */
 void xone_mt76_stop_rx(struct xone_mt76 *mt)
 {
 	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
@@ -1323,35 +1290,28 @@ static int xone_mt76_count_client_slots(struct xone_mt76 *mt, int *addrs)
 }
 
 /*
- * Mainline mt76x2u_init_hardware() resets the whole WCID and key tables at
- * every init ("reset wcid table", "reset shared key table and pairwise key
- * table"). xone only clears a slot when a controller disconnects cleanly, so
- * after a reboot, resume or crash a slot can keep an old address and an old
- * pairwise key; a controller that reconnects into it only gets its address
- * rewritten (xone_mt76_associate_client()).
+ * Mainline resets the WCID and key tables at every init; xone only clears a
+ * slot on a clean disconnect, and its register init doesn't clear them (seen:
+ * 16 slots with a key mode left after a driver reload). A controller that
+ * reconnects into such a slot only gets its address rewritten.
  */
-static void xone_mt76_reset_client_slots(struct xone_mt76 *mt,
-					 int keys_at_start, int addrs_at_start)
+static void xone_mt76_reset_client_slots(struct xone_mt76 *mt, int keys,
+					 int addrs)
 {
 	u8 addr[8] = {}, iv[8] = {}, key[XONE_MT_WCID_KEY_LEN] = {};
 	__le32 attr = 0;
-	int i, keys, addrs;
-
-	keys = xone_mt76_count_client_slots(mt, &addrs);
-
-	if (keys_at_start || addrs_at_start || keys || addrs)
-		dev_info(mt->dev,
-			 "xone-fix: radio init: client slots left from before: %d with key, %d with address (after register init: %d / %d)\n",
-			 keys_at_start, addrs_at_start, keys, addrs);
+	bool clear;
+	int i;
 
 	if (!keys && !addrs)
 		return;
 
-	if (!xone_fix_pick(fix_wcid_reset)) {
-		dev_info(mt->dev,
-			 "xone-fix: radio init: client slots not cleared (fix_wcid_reset off)\n");
+	clear = xone_fix_pick(fix_wcid_reset);
+	dev_info(mt->dev,
+		 "xone-fix: radio init: client slots left from before: %d with key, %d with address: %s\n",
+		 keys, addrs, clear ? "cleared" : "kept (fix_wcid_reset off)");
+	if (!clear)
 		return;
-	}
 
 	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
 		xone_mt76_write_burst(mt, MT_WCID_ATTR(i), &attr, sizeof(attr));
@@ -1359,18 +1319,13 @@ static void xone_mt76_reset_client_slots(struct xone_mt76 *mt,
 		xone_mt76_write_burst(mt, MT_WCID_IV(i), iv, sizeof(iv));
 		xone_mt76_write_burst(mt, MT_WCID_ADDR(i), addr, sizeof(addr));
 	}
-
-	keys = xone_mt76_count_client_slots(mt, &addrs);
-	dev_info(mt->dev,
-		 "xone-fix: radio init: client slots cleared (now %d with key, %d with address)\n",
-		 keys, addrs);
 }
 
 int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
-	int err, keys_at_start, addrs_at_start;
+	int err, stale_keys, stale_addrs;
 
-	keys_at_start = xone_mt76_count_client_slots(mt, &addrs_at_start);
+	stale_keys = xone_mt76_count_client_slots(mt, &stale_addrs);
 
 	dev_dbg(mt->dev, "%s: id=0x%04x\n", __func__,
 		xone_mt76_get_chip_id(mt));
@@ -1388,7 +1343,7 @@ int xone_mt76_init_radio(struct xone_mt76 *mt)
 		return err;
 
 	xone_mt76_init_registers(mt);
-	xone_mt76_reset_client_slots(mt, keys_at_start, addrs_at_start);
+	xone_mt76_reset_client_slots(mt, stale_keys, stale_addrs);
 
 	err = xone_mt76_calibrate_crystal(mt);
 	if (err)
