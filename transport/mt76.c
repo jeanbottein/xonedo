@@ -491,6 +491,148 @@ static int xone_mt76_send_firmware(struct xone_mt76 *mt,
 					    dlm_len);
 }
 
+static void xone_mt76_rmw(struct xone_mt76 *mt, u32 addr, u32 clear, u32 set)
+{
+	u32 val = xone_mt76_read_register(mt, addr);
+
+	xone_mt76_write_register(mt, addr, (val & ~clear) | set);
+}
+
+#define XONE_MT_CFG(addr) ((addr) | MT_VEND_TYPE_CFG)
+#define xone_mt76_set(mt, addr, bits) xone_mt76_rmw(mt, addr, 0, bits)
+#define xone_mt76_clear(mt, addr, bits) xone_mt76_rmw(mt, addr, bits, 0)
+
+/* same steps as mainline mt76x2_reset_wlan(dev, true) */
+static void xone_mt76_reset_wlan(struct xone_mt76 *mt)
+{
+	u32 val = xone_mt76_read_register(mt, MT_WLAN_FUN_CTRL);
+
+	dev_dbg(mt->dev, "%s: WLAN_FUN_CTRL=0x%08x\n", __func__, val);
+
+	val &= ~MT_WLAN_FUN_CTRL_FRC_WL_ANT_SEL;
+
+	if (val & MT_WLAN_FUN_CTRL_WLAN_EN) {
+		xone_mt76_write_register(mt, MT_WLAN_FUN_CTRL,
+					 val | MT_WLAN_FUN_CTRL_WLAN_RESET_RF);
+		udelay(20);
+	}
+
+	xone_mt76_write_register(mt, MT_WLAN_FUN_CTRL, val);
+	udelay(20);
+
+	xone_mt76_write_register(mt, MT_WLAN_FUN_CTRL,
+				 val | MT_WLAN_FUN_CTRL_WLAN_EN |
+				 MT_WLAN_FUN_CTRL_WLAN_CLK_EN);
+	udelay(20);
+}
+
+/* same steps as mainline mt76x2u_power_on_rf() + mt76x2u_power_on_rf_patch() */
+static void xone_mt76_power_on_rf(struct xone_mt76 *mt, int unit)
+{
+	int shift = unit ? 8 : 0;
+
+	/* enable RF BG */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130), BIT(0) << shift);
+	usleep_range(10, 20);
+
+	/* enable RFDIG LDO/AFE/ABB/ADDA */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130),
+		      (BIT(1) | BIT(3) | BIT(4) | BIT(5)) << shift);
+	usleep_range(10, 20);
+
+	/* switch RFDIG power to internal LDO */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0130), BIT(2) << shift);
+	usleep_range(10, 20);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130), BIT(0) | BIT(16));
+	udelay(1);
+
+	xone_mt76_clear(mt, XONE_MT_CFG(0x001c), 0xff);
+	xone_mt76_set(mt, XONE_MT_CFG(0x001c), 0x30);
+
+	xone_mt76_write_register(mt, XONE_MT_CFG(0x0014), 0x484f);
+	udelay(1);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130), BIT(17));
+	usleep_range(150, 200);
+
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0130), BIT(16));
+	usleep_range(50, 100);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x014c), BIT(19) | BIT(20));
+
+	xone_mt76_set(mt, 0x0530, 0x0f);
+}
+
+/* same steps as mainline mt76x2u_power_on() */
+static void xone_mt76_power_on(struct xone_mt76 *mt)
+{
+	u32 ack = MT_WLAN_MTC_CTRL_STATE_UP | MT_WLAN_MTC_CTRL_PWR_ACK |
+		  MT_WLAN_MTC_CTRL_PWR_ACK_S;
+
+	/* turn on WL MTCMOS */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0148), MT_WLAN_MTC_CTRL_MTCMOS_PWR_UP);
+
+	if (!xone_mt76_poll(mt, XONE_MT_CFG(0x0148), ack, ack))
+		dev_dbg(mt->dev, "%s: no MTCMOS power ack\n", __func__);
+
+	/* power up the BBP/PBF/FCE/TSO memories and pulse their reset */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0148), 0x7f << 16);
+	usleep_range(10, 20);
+
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0148), 0xf << 24);
+	usleep_range(10, 20);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x0148), 0xf << 24);
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0148), 0xfff);
+
+	/* turn on AD/DA power down */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x1204), BIT(3));
+
+	/* WLAN function enable */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0080), BIT(0));
+
+	/* release BBP software reset */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0064), BIT(18));
+
+	xone_mt76_power_on_rf(mt, 0);
+	xone_mt76_power_on_rf(mt, 1);
+}
+
+/* same as mainline mt76x02_wait_for_mac() */
+static int xone_mt76_wait_for_mac(struct xone_mt76 *mt)
+{
+	u32 val;
+	int i;
+
+	for (i = 0; i < 100; i++) {
+		val = xone_mt76_read_register(mt, MT_MAC_CSR0);
+		if (val && val != ~0U) {
+			dev_dbg(mt->dev, "%s: MAC_CSR0=0x%08x after %d tries\n",
+				__func__, val, i);
+			return 0;
+		}
+
+		usleep_range(5000, 10000);
+	}
+
+	return -ETIMEDOUT;
+}
+
+/*
+ * A warm chip (USB power never cut) keeps its RF state and its BBP/PBF/FCE/TSO
+ * memories through an MCU reset. Mainline mt76x2u resets and powers up the
+ * WLAN block before every firmware load (mt76x2u_init_hardware()), so do the
+ * same before resetting the MCU.
+ */
+static int xone_mt76_reset_wlan_hw(struct xone_mt76 *mt)
+{
+	xone_mt76_reset_wlan(mt);
+	xone_mt76_power_on(mt);
+
+	return xone_mt76_wait_for_mac(mt);
+}
+
 static int xone_mt76_reset_firmware(struct xone_mt76 *mt)
 {
 	int err;
@@ -519,6 +661,10 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
+		err = xone_mt76_reset_wlan_hw(mt);
+		if (err)
+			return err;
+
 		err = xone_mt76_reset_firmware(mt);
 		if (err)
 			return err;
