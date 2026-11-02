@@ -641,8 +641,8 @@ static void xone_mt76_log_queues(struct xone_mt76 *mt, const char *when)
 #define XONE_MT_DRAIN_LEN 0x10000
 
 /* read and drop what the chip still holds for the host on one endpoint */
-static void xone_mt76_drain_ep(struct xone_mt76 *mt, u8 ep, void *buf,
-			       const char *when)
+static int xone_mt76_drain_ep(struct xone_mt76 *mt, u8 ep, void *buf,
+			      const char *when, int *packets)
 {
 	int i, err = 0, actual, total = 0;
 
@@ -657,19 +657,28 @@ static void xone_mt76_drain_ep(struct xone_mt76 *mt, u8 ep, void *buf,
 
 	dev_dbg(mt->dev, "%s: %s: ep 0x%02x: %d transfers, %d bytes, end %d\n",
 		__func__, when, ep, i, total, err);
+
+	*packets += i;
+	return total;
 }
 
-static void xone_mt76_drain(struct xone_mt76 *mt, const char *when)
+/* returns the number of bytes read out, *packets = number of transfers */
+static int xone_mt76_drain(struct xone_mt76 *mt, const char *when,
+			   int *packets)
 {
 	void *buf = kmalloc(XONE_MT_DRAIN_LEN, GFP_KERNEL);
+	int bytes;
 
+	*packets = 0;
 	if (!buf)
-		return;
+		return 0;
 
-	xone_mt76_drain_ep(mt, XONE_MT_EP_IN_WLAN, buf, when);
-	xone_mt76_drain_ep(mt, XONE_MT_EP_IN_CMD, buf, when);
+	bytes = xone_mt76_drain_ep(mt, XONE_MT_EP_IN_WLAN, buf, when, packets);
+	bytes += xone_mt76_drain_ep(mt, XONE_MT_EP_IN_CMD, buf, when, packets);
 	kfree(buf);
 	xone_mt76_log_queues(mt, when);
+
+	return bytes;
 }
 
 /*
@@ -679,10 +688,20 @@ static void xone_mt76_drain(struct xone_mt76 *mt, const char *when)
  */
 static void xone_mt76_quiesce(struct xone_mt76 *mt)
 {
+	int bytes, packets;
+
 	xone_mt76_log_queues(mt, "warm");
 	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
 	msleep(20);
-	xone_mt76_drain(mt, "mac stopped");
+	bytes = xone_mt76_drain(mt, "mac stopped", &packets);
+
+	if (bytes)
+		dev_info(mt->dev,
+			 "xone-fix: warm start: read out %d packets (%d bytes) of leftover radio data before the firmware upload\n",
+			 packets, bytes);
+	else
+		dev_info(mt->dev,
+			 "xone-fix: warm start: no leftover radio data\n");
 }
 
 /*
@@ -732,7 +751,8 @@ static int xone_mt76_reset_firmware(struct xone_mt76 *mt)
 int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 {
 	u32 val;
-	int err;
+	int err, i;
+	bool warm = false;
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
@@ -746,7 +766,11 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 		if (err)
 			return err;
 
-		xone_mt76_drain(mt, "mcu reset");
+		if (xone_mt76_drain(mt, "mcu reset", &i))
+			dev_info(mt->dev,
+				 "xone-fix: warm start: more leftover data after the MCU reset (%d packets)\n",
+				 i);
+		warm = true;
 	}
 
 	dev_dbg(mt->dev, "%s: loading firmware...\n", __func__);
@@ -776,6 +800,10 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 	err = xone_mt76_load_ivb(mt);
 	if (err)
 		return err;
+
+	if (warm)
+		dev_info(mt->dev,
+			 "xone-fix: warm start: fresh firmware uploaded\n");
 
 	/*
 	 * After xone_mt76_load_ivb() the MT76 chip briefly disconnects from

@@ -61,6 +61,11 @@ struct xone_dongle_client {
 	bool encryption_enabled;
 	/* channel to go back to if this client retries its association */
 	u8 hop_back_idx;
+	bool hopped_back;
+	/* connection timing, logged with the first data from the client */
+	unsigned long assoc_time;
+	int assoc_retries;
+	bool first_data_seen;
 
 	struct gip_adapter *adapter;
 };
@@ -588,9 +593,20 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 		 * missed our response: it is still on the previous primary
 		 * channel. Go back there once.
 		 */
+		client->assoc_retries++;
+		dev_info(dongle->mt.dev,
+			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request): answer resent\n",
+			 addr, client->assoc_retries,
+			 jiffies_to_msecs(jiffies - client->assoc_time));
+
 		if (client->hop_back_idx != XONE_DONGLE_HOP_NONE) {
+			dev_info(dongle->mt.dev,
+				 "xone-fix: controller %pM: it connected right after a channel hop, going back to channel %u\n",
+				 addr,
+				 dongle->mt.channels[client->hop_back_idx].index);
 			xone_dongle_hop_back(dongle, client->hop_back_idx);
 			client->hop_back_idx = XONE_DONGLE_HOP_NONE;
+			client->hopped_back = true;
 		}
 
 		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
@@ -600,14 +616,16 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	if (IS_ERR(client))
 		return PTR_ERR(client);
 
+	client->assoc_time = jiffies;
 	client->hop_back_idx = XONE_DONGLE_HOP_NONE;
 	if (dongle->hop_prev_idx != XONE_DONGLE_HOP_NONE &&
 	    time_before(jiffies, dongle->hop_time + XONE_DONGLE_HOP_GRACE)) {
 		client->hop_back_idx = dongle->hop_prev_idx;
-		dev_dbg(dongle->mt.dev,
-			"%s: association %u ms after a hop from channel %u\n",
-			__func__, jiffies_to_msecs(jiffies - dongle->hop_time),
-			dongle->mt.channels[client->hop_back_idx].index);
+		dev_info(dongle->mt.dev,
+			 "xone-fix: controller %pM connected %u ms after a channel hop %u -> %u (it may miss our answer; will go back if it retries)\n",
+			 addr, jiffies_to_msecs(jiffies - dongle->hop_time),
+			 dongle->mt.channels[client->hop_back_idx].index,
+			 dongle->mt.channel ? dongle->mt.channel->index : 0);
 	}
 
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
@@ -791,6 +809,17 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		 */
 		if (dongle->pairing)
 			dongle->last_wlan_rx = jiffies;
+
+		if (!client->first_data_seen) {
+			client->first_data_seen = true;
+			dev_info(dongle->mt.dev,
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d%s)\n",
+				 client->address,
+				 jiffies_to_msecs(jiffies - client->assoc_time),
+				 client->assoc_retries,
+				 client->hopped_back ? ", after going back to the previous channel" : "");
+		}
+
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
 	}
 
@@ -1224,6 +1253,8 @@ static void xone_dongle_fw_load(struct work_struct *work)
 		err = xone_mt76_load_firmware(mt, fw);
 		if (!err)
 			break;
+		dev_warn(mt->dev, "xone-fix: firmware load attempt %d failed: %d\n",
+			 i + 1, err);
 		ssleep(1);
 	}
 	release_firmware(fw);
