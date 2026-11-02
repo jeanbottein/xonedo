@@ -327,35 +327,6 @@ static int xone_mt76_write_burst(struct xone_mt76 *mt, u32 idx,
 	return xone_mt76_send_command(mt, skb, MT_CMD_BURST_WRITE);
 }
 
-/*
- * Write a WCID table entry directly over USB, like mainline mt76_wr_copy().
- * Sent through the firmware (MT_CMD_BURST_WRITE) the address sometimes never
- * landed, and all frames from that controller came in as WCID 0xff.
- */
-static int xone_mt76_write_copy(struct xone_mt76 *mt, u32 offset,
-				const void *data, int len, bool verify)
-{
-	u8 word[4];
-	u32 val;
-	int i;
-
-	for (i = 0; i < len; i += sizeof(word)) {
-		memset(word, 0, sizeof(word));
-		memcpy(word, data + i, min_t(int, len - i, sizeof(word)));
-		val = get_unaligned_le32(word);
-		xone_mt76_write_register(mt, offset + i, val);
-
-		if (verify && xone_mt76_read_register(mt, offset + i) != val) {
-			dev_warn(mt->dev,
-				 "xone-fix: WCID table write at 0x%04x did not stick\n",
-				 offset + i);
-			return -EIO;
-		}
-	}
-
-	return 0;
-}
-
 int xone_mt76_set_led_mode(struct xone_mt76 *mt, enum xone_mt76_led_mode mode)
 {
 	struct sk_buff *skb;
@@ -1327,10 +1298,10 @@ static void xone_mt76_reset_client_slots(struct xone_mt76 *mt, int keys,
 		 keys, addrs);
 
 	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
-		xone_mt76_write_copy(mt, MT_WCID_ATTR(i), &attr, sizeof(attr), true);
-		xone_mt76_write_copy(mt, MT_WCID_KEY(i), key, sizeof(key), false);
-		xone_mt76_write_copy(mt, MT_WCID_IV(i), iv, sizeof(iv), false);
-		xone_mt76_write_copy(mt, MT_WCID_ADDR(i), addr, sizeof(addr), true);
+		xone_mt76_write_burst(mt, MT_WCID_ATTR(i), &attr, sizeof(attr));
+		xone_mt76_write_burst(mt, MT_WCID_KEY(i), key, sizeof(key));
+		xone_mt76_write_burst(mt, MT_WCID_IV(i), iv, sizeof(iv));
+		xone_mt76_write_burst(mt, MT_WCID_ADDR(i), addr, sizeof(addr));
 	}
 }
 
@@ -1594,7 +1565,7 @@ int xone_mt76_associate_client(struct xone_mt76 *mt, u8 wcid, u8 *addr)
 	skb_put_data(skb, &mgmt, mgmt_len);
 	memset(skb_put(skb, 8), 0, 8);
 
-	err = xone_mt76_write_copy(mt, MT_WCID_ADDR(wcid), addr, ETH_ALEN, true);
+	err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr, ETH_ALEN);
 	if (err)
 		goto err_free_skb;
 
@@ -1665,16 +1636,16 @@ int xone_mt76_set_client_key(struct xone_mt76 *mt, u8 wcid, u8 *key, int len)
 	if (len != XONE_MT_WCID_KEY_LEN)
 		return -EINVAL;
 
-	err = xone_mt76_write_copy(mt, MT_WCID_KEY(wcid), key, len, false);
+	err = xone_mt76_write_burst(mt, MT_WCID_KEY(wcid), key, len);
 	if (err)
 		return err;
 
-	err = xone_mt76_write_copy(mt, MT_WCID_IV(wcid), iv, sizeof(iv), false);
+	err = xone_mt76_write_burst(mt, MT_WCID_IV(wcid), iv, sizeof(iv));
 	if (err)
 		return err;
 
-	return xone_mt76_write_copy(mt, MT_WCID_ATTR(wcid), &attr,
-				    sizeof(attr), true);
+	return xone_mt76_write_burst(mt, MT_WCID_ATTR(wcid),
+				     &attr, sizeof(attr));
 }
 
 int xone_mt76_remove_client(struct xone_mt76 *mt, u8 wcid)
@@ -1691,20 +1662,18 @@ int xone_mt76_remove_client(struct xone_mt76 *mt, u8 wcid)
 	if (err)
 		return err;
 
-	err = xone_mt76_write_copy(mt, MT_WCID_ADDR(wcid), addr, sizeof(addr),
-				   true);
+	err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr, sizeof(addr));
 	if (err)
 		return err;
 
-	err = xone_mt76_write_copy(mt, MT_WCID_IV(wcid), iv, sizeof(iv), false);
+	err = xone_mt76_write_burst(mt, MT_WCID_IV(wcid), iv, sizeof(iv));
 	if (err)
 		return err;
 
-	err = xone_mt76_write_copy(mt, MT_WCID_ATTR(wcid), &attr, sizeof(attr),
-				   true);
+	err = xone_mt76_write_burst(mt, MT_WCID_ATTR(wcid),
+				    &attr, sizeof(attr));
 	if (err)
 		return err;
 
-	return xone_mt76_write_copy(mt, MT_WCID_KEY(wcid), key, sizeof(key),
-				    false);
+	return xone_mt76_write_burst(mt, MT_WCID_KEY(wcid), key, sizeof(key));
 }
