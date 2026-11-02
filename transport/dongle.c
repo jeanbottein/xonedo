@@ -59,9 +59,9 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
-	/* channel to go back to if this client retries its association */
+	/* other channel of the wide channel to try if this client retries */
 	u8 hop_back_idx;
-	bool hopped_back;
+	int hop_flips;
 	/* connection timing, logged with the first data from the client */
 	unsigned long assoc_time;
 	int assoc_retries;
@@ -138,7 +138,9 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 }
 
 #define XONE_DONGLE_HOP_NONE 0xff
-#define XONE_DONGLE_HOP_GRACE msecs_to_jiffies(500)
+/* a controller can take up to one scan interval to answer a beacon */
+#define XONE_DONGLE_HOP_GRACE XONE_DONGLE_PAIR_SCAN_INTERVAL
+#define XONE_DONGLE_HOP_MAX_FLIPS 4
 
 /*
  * 5 GHz channels used as one 40/80 MHz channel: 36/40, 44/48 and 149-161.
@@ -599,14 +601,21 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 			 addr, client->assoc_retries,
 			 jiffies_to_msecs(jiffies - client->assoc_time));
 
-		if (client->hop_back_idx != XONE_DONGLE_HOP_NONE) {
+		/*
+		 * Try the other channel of the pair on each retry: the
+		 * previous one first, back again if that was the wrong guess.
+		 */
+		if (client->hop_back_idx != XONE_DONGLE_HOP_NONE &&
+		    client->hop_flips < XONE_DONGLE_HOP_MAX_FLIPS) {
+			u8 cur_idx = xone_dongle_find_channel_idx(dongle);
+
 			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM: it connected right after a channel hop, going back to channel %u\n",
+				 "xone-fix: controller %pM: it connected right after a channel hop, switching to channel %u\n",
 				 addr,
 				 dongle->mt.channels[client->hop_back_idx].index);
 			xone_dongle_hop_back(dongle, client->hop_back_idx);
-			client->hop_back_idx = XONE_DONGLE_HOP_NONE;
-			client->hopped_back = true;
+			client->hop_back_idx = cur_idx;
+			client->hop_flips++;
 		}
 
 		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
@@ -622,7 +631,7 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	    time_before(jiffies, dongle->hop_time + XONE_DONGLE_HOP_GRACE)) {
 		client->hop_back_idx = dongle->hop_prev_idx;
 		dev_info(dongle->mt.dev,
-			 "xone-fix: controller %pM connected %u ms after a channel hop %u -> %u (it may miss our answer; will go back if it retries)\n",
+			 "xone-fix: controller %pM connected %u ms after a channel hop %u -> %u (it may miss our answer; will switch if it retries)\n",
 			 addr, jiffies_to_msecs(jiffies - dongle->hop_time),
 			 dongle->mt.channels[client->hop_back_idx].index,
 			 dongle->mt.channel ? dongle->mt.channel->index : 0);
@@ -813,11 +822,11 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		if (!client->first_data_seen) {
 			client->first_data_seen = true;
 			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM answered %u ms after its first request (retries %d%s)\n",
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, on channel %u)\n",
 				 client->address,
 				 jiffies_to_msecs(jiffies - client->assoc_time),
-				 client->assoc_retries,
-				 client->hopped_back ? ", after going back to the previous channel" : "");
+				 client->assoc_retries, client->hop_flips,
+				 dongle->mt.channel ? dongle->mt.channel->index : 0);
 		}
 
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
