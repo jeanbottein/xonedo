@@ -127,6 +127,16 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 	return 0;
 }
 
+/*
+ * The pairing channel scan (dlundqvist/xone#168) was added for the 02fe
+ * dongle. On 02e6, which never needed it (xow), controllers connect in 4-5 s
+ * without it instead of 10-15 s.
+ */
+static bool xone_dongle_wants_pairing_scan(struct xone_dongle *dongle)
+{
+	return dongle->product != 0x02e6;
+}
+
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
 				    struct sk_buff *skb,
 				    enum xone_dongle_queue queue)
@@ -285,8 +295,9 @@ static int xone_dongle_pairing_handler(struct xone_dongle *dongle, bool enable,
 		dongle->pairing_scan_idx = xone_dongle_find_channel_idx(dongle);
 		mod_delayed_work(system_wq, &dongle->pairing_work,
 				 msecs_to_jiffies(timeout_secs * 1000));
-		mod_delayed_work(system_wq, &dongle->pairing_scan_work,
-				 XONE_DONGLE_PAIR_SCAN_INTERVAL);
+		if (xone_dongle_wants_pairing_scan(dongle))
+			mod_delayed_work(system_wq, &dongle->pairing_scan_work,
+					 XONE_DONGLE_PAIR_SCAN_INTERVAL);
 	} else {
 		cancel_delayed_work(&dongle->pairing_scan_work);
 	}
