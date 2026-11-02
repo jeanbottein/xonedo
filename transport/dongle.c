@@ -1247,6 +1247,19 @@ static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index,
 	return err;
 }
 
+/*
+ * Mainline stops the MAC on cleanup. Left receiving, a chip that keeps USB
+ * power piles up controller traffic until the next firmware load.
+ */
+static void xone_dongle_stop_rx(struct xone_dongle *dongle)
+{
+	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY ||
+	    dongle->mt.udev->state == USB_STATE_NOTATTACHED)
+		return;
+
+	xone_mt76_stop_rx(&dongle->mt);
+}
+
 static int xone_dongle_power_off_clients(struct xone_dongle *dongle)
 {
 	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY)
@@ -1377,6 +1390,7 @@ static void xone_dongle_disconnect(struct usb_interface *intf)
 		dev_dbg(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
 
+	xone_dongle_stop_rx(dongle);
 	xone_dongle_destroy(dongle);
 	usb_set_intfdata(intf, NULL);
 }
@@ -1444,13 +1458,17 @@ static void xone_dongle_shutdown(struct usb_interface *intf)
 	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY)
 		dongle->fw_state = XONE_DONGLE_FW_STATE_STOP_LOADING;
 
-	if (system_state == SYSTEM_RESTART)
+	if (system_state == SYSTEM_RESTART) {
+		xone_dongle_stop_rx(dongle);
 		return;
+	}
 
 	err = xone_dongle_power_off_clients(dongle);
 	if (err)
 		dev_err(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
+
+	xone_dongle_stop_rx(dongle);
 }
 
 static int xone_dongle_pre_reset(struct usb_interface *intf)

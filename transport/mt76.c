@@ -1160,6 +1160,11 @@ static u16 xone_mt76_get_chip_id(struct xone_mt76 *mt)
 	return (id[1] << 8) | id[2];
 }
 
+void xone_mt76_stop_rx(struct xone_mt76 *mt)
+{
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+}
+
 int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
 	int err;
