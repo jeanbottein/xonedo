@@ -61,6 +61,8 @@ struct xone_dongle_client {
 	bool encryption_enabled;
 	int assoc_retries;
 	bool connected;
+	/* debug: logged with the client's first data */
+	unsigned long assoc_time;
 
 	struct gip_adapter *adapter;
 };
@@ -580,6 +582,11 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 		if (!client || !ether_addr_equal(client->address, addr))
 			continue;
 
+		dev_info(dongle->mt.dev,
+			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request)\n",
+			 addr, client->assoc_retries + 1,
+			 jiffies_to_msecs(jiffies - client->assoc_time));
+
 		/* safety net for anything else that leaves a client stuck */
 		if (++client->assoc_retries == 3 &&
 		    xone_dongle_self_reset(dongle, "client still can't connect"))
@@ -596,6 +603,8 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	client = xone_dongle_create_client(dongle, addr);
 	if (IS_ERR(client))
 		return PTR_ERR(client);
+
+	client->assoc_time = jiffies;
 
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
 	if (err) {
@@ -782,6 +791,13 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		 */
 		if (dongle->pairing)
 			dongle->last_wlan_rx = jiffies;
+		if (!client->connected)
+			dev_info(dongle->mt.dev,
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, on channel %u)\n",
+				 client->address,
+				 jiffies_to_msecs(jiffies - client->assoc_time),
+				 client->assoc_retries,
+				 dongle->mt.channel ? dongle->mt.channel->index : 0);
 		client->connected = true;
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
 	}
@@ -1213,9 +1229,12 @@ static void xone_dongle_fw_load(struct work_struct *work)
 
 
 	for (int i = 0; i < 5; ++i) {
+		mt->fw_attempt = i + 1;
 		err = xone_mt76_load_firmware(mt, fw);
 		if (!err)
 			break;
+		dev_warn(mt->dev, "xone-fix: firmware load attempt %d failed: %d\n",
+			 i + 1, err);
 		ssleep(1);
 	}
 	release_firmware(fw);
@@ -1325,6 +1344,7 @@ static void xone_dongle_stop_rx(struct xone_dongle *dongle)
 		return;
 
 	xone_mt76_stop_rx(&dongle->mt);
+	dev_info(dongle->mt.dev, "xone-fix: unload: radio receive stopped\n");
 }
 
 static int xone_dongle_power_off_clients(struct xone_dongle *dongle)

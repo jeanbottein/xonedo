@@ -60,6 +60,9 @@ struct xone_mt76 {
 
 	struct xone_mt76_channel channels[XONE_MT_NUM_CHANNELS];
 	struct xone_mt76_channel *channel;
+
+	/* debug: firmware load attempt number, for the xone-fix log line */
+	int fw_attempt;
 };
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
