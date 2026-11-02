@@ -22,6 +22,11 @@ ushort fw_override_pid = 0;
 MODULE_PARM_DESC(fw_override, "Use firmware for the provided product ID instead of the one detected automatically");
 module_param_named(fw_override, fw_override_pid, ushort, 0600);
 
+/* debug/test only: unattended warm-reload tests (controllers stay on) */
+static bool test_keep_clients;
+module_param(test_keep_clients, bool, 0644);
+MODULE_PARM_DESC(test_keep_clients, "Test only: don't power controllers off when the driver unloads, so they reconnect by themselves after a reload");
+
 #define XONE_DONGLE_NUM_IN_URBS 12
 #define XONE_DONGLE_NUM_OUT_URBS 12
 
@@ -1477,7 +1482,7 @@ static void xone_dongle_disconnect(struct usb_interface *intf)
 	device_remove_groups(&intf->dev, xone_dongle_groups);
 
 	/* can fail during USB device removal */
-	err = xone_dongle_power_off_clients(dongle);
+	err = test_keep_clients ? 0 : xone_dongle_power_off_clients(dongle);
 	if (err)
 		dev_dbg(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
