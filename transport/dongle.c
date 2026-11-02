@@ -925,9 +925,10 @@ static int xone_dongle_handle_loss(struct xone_dongle *dongle,
 }
 
 /*
- * Debug: frames from one of our controllers that would be dropped silently
- * (data without a matching WCID, or a frame type we ignore). This is how
- * WCID 0xff (address missing from the WCID table) was found.
+ * Debug: frames from one of our controllers that the chip did not match to
+ * its WCID (tag 0xff or a free slot), so xone drops them silently. This is how
+ * the missing WCID table address was found. Frames tagged with the
+ * controller's slot (idle QoS-null, probe requests) are normal and not logged.
  */
 static void xone_dongle_log_dropped(struct xone_dongle *dongle,
 				    struct ieee80211_hdr_3addr *hdr, u16 type,
@@ -944,11 +945,11 @@ static void xone_dongle_log_dropped(struct xone_dongle *dongle,
 		return;
 	}
 
-	spin_lock_irqsave(&dongle->clients_lock, flags);
+	/* lockless pre-check: the common case (a known slot) costs nothing */
+	if (wcid && wcid <= XONE_DONGLE_MAX_CLIENTS && dongle->clients[wcid - 1])
+		return;
 
-	if (kind == (IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA) &&
-	    wcid && wcid <= XONE_DONGLE_MAX_CLIENTS && dongle->clients[wcid - 1])
-		goto out_unlock;
+	spin_lock_irqsave(&dongle->clients_lock, flags);
 
 	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
 		if (dongle->clients[i] &&
@@ -960,7 +961,6 @@ static void xone_dongle_log_dropped(struct xone_dongle *dongle,
 		}
 	}
 
-out_unlock:
 	spin_unlock_irqrestore(&dongle->clients_lock, flags);
 }
 
