@@ -113,6 +113,9 @@ struct xone_dongle {
 	enum xone_dongle_fw_state fw_state;
 	u16 vendor;
 	u16 product;
+
+	/* last reset requested by the driver itself (0 = never) */
+	unsigned long self_reset_time;
 };
 
 static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index, bool silent);
@@ -562,6 +565,22 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 		if (err)
 			dev_err(dongle->mt.dev, "%s: remove client failed: %d\n",
 				__func__, err);
+
+		/*
+		 * Still retrying: the firmware session is likely ignoring our
+		 * writes, which only a USB reset has cured. At most once a
+		 * minute, so this can't loop.
+		 */
+		if (client->assoc_retries == 3 &&
+		    (!dongle->self_reset_time ||
+		     time_after(jiffies, dongle->self_reset_time + 60 * HZ))) {
+			dongle->self_reset_time = jiffies | 1;
+			dev_warn(dongle->mt.dev,
+				 "xone-fix: controller %pM still can't connect: resetting the dongle\n",
+				 addr);
+			usb_queue_reset_device(to_usb_interface(dongle->mt.dev));
+			return 0;
+		}
 
 		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
 	}

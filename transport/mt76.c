@@ -1559,6 +1559,7 @@ static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
 				       u8 *addr)
 {
 	int try, i, err;
+	u32 hi;
 
 	for (try = 1; try <= 3; try++) {
 		err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr,
@@ -1581,6 +1582,20 @@ static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
 			 "xone-fix: WCID %d address write %d did not land\n",
 			 wcid, try);
 	}
+
+	/*
+	 * Some firmware sessions ignore these burst writes until a USB reset.
+	 * Write the 6 address bytes directly, keeping the rest of the entry as
+	 * the burst write would.
+	 */
+	hi = xone_mt76_read_register(mt, MT_WCID_ADDR(wcid) + 4);
+	xone_mt76_write_register(mt, MT_WCID_ADDR(wcid),
+				 get_unaligned_le32(addr));
+	xone_mt76_write_register(mt, MT_WCID_ADDR(wcid) + 4,
+				 (hi & 0xffff0000) | get_unaligned_le16(addr + 4));
+	dev_warn(mt->dev,
+		 "xone-fix: WCID %d address written directly: %s\n", wcid,
+		 xone_mt76_client_addr_is(mt, wcid, addr) ? "landed" : "did not land");
 
 	return 0;
 }
