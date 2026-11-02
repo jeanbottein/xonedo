@@ -22,6 +22,14 @@ ushort fw_override_pid = 0;
 MODULE_PARM_DESC(fw_override, "Use firmware for the provided product ID instead of the one detected automatically");
 module_param_named(fw_override, fw_override_pid, ushort, 0600);
 
+static int fix_stop_on_unload = 1;
+module_param(fix_stop_on_unload, int, 0644);
+MODULE_PARM_DESC(fix_stop_on_unload, "Driver unload/shutdown: stop the radio receiving, so traffic doesn't pile up in the chip for the next start (0=off, 1=on, 2=random)");
+
+static int pairing_scan = 1;
+module_param(pairing_scan, int, 0644);
+MODULE_PARM_DESC(pairing_scan, "Pairing: hop channels every 2 s while waiting for a controller (added for the 02fe dongle; 0=off, 1=on)");
+
 static int fix_hop_back = 1;
 module_param(fix_hop_back, int, 0644);
 MODULE_PARM_DESC(fix_hop_back, "Pairing: switch back to the channel before the last hop when a controller retries its association (0=off, 1=on, 2=random per controller)");
@@ -382,6 +390,9 @@ static void xone_dongle_pairing_scan(struct work_struct *work)
 
 	if (!dongle->pairing)
 		goto out_unlock;
+
+	if (!pairing_scan)
+		goto out_resched;
 
 	/*
 	 * Once a controller has sent an association request the dongle and
@@ -816,12 +827,12 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		if (!client->first_data_seen) {
 			client->first_data_seen = true;
 			dev_info(dongle->mt.dev,
-				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, on channel %u) hop_back=%d after_hop=%d\n",
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, channel switches %d, on channel %u) scan=%d hop_back=%d after_hop=%d\n",
 				 client->address,
 				 jiffies_to_msecs(jiffies - client->assoc_time),
 				 client->assoc_retries, client->hop_flips,
 				 dongle->mt.channel ? dongle->mt.channel->index : 0,
-				 client->hop_enabled, client->hop_armed);
+				 pairing_scan, client->hop_enabled, client->hop_armed);
 		}
 
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
@@ -1358,6 +1369,29 @@ static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index,
 	return err;
 }
 
+/*
+ * Mainline mt76x2u stops the MAC on cleanup; xone left it receiving, so with
+ * USB power kept on, controller traffic piled up in the chip until the next
+ * firmware load (which then could stall). Not on a physical unplug.
+ */
+static void xone_dongle_stop_on_unload(struct xone_dongle *dongle,
+				       const char *when)
+{
+	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY ||
+	    dongle->mt.udev->state == USB_STATE_NOTATTACHED)
+		return;
+
+	if (!xone_fix_pick(fix_stop_on_unload)) {
+		dev_info(dongle->mt.dev,
+			 "xone-fix: %s: radio left receiving (fix_stop_on_unload off)\n",
+			 when);
+		return;
+	}
+
+	xone_mt76_stop_rx(&dongle->mt);
+	dev_info(dongle->mt.dev, "xone-fix: %s: radio receive stopped\n", when);
+}
+
 static int xone_dongle_power_off_clients(struct xone_dongle *dongle)
 {
 	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY)
@@ -1488,6 +1522,7 @@ static void xone_dongle_disconnect(struct usb_interface *intf)
 		dev_dbg(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
 
+	xone_dongle_stop_on_unload(dongle, "unload");
 	xone_dongle_destroy(dongle);
 	usb_set_intfdata(intf, NULL);
 }
@@ -1555,13 +1590,17 @@ static void xone_dongle_shutdown(struct usb_interface *intf)
 	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY)
 		dongle->fw_state = XONE_DONGLE_FW_STATE_STOP_LOADING;
 
-	if (system_state == SYSTEM_RESTART)
+	if (system_state == SYSTEM_RESTART) {
+		xone_dongle_stop_on_unload(dongle, "restart");
 		return;
+	}
 
 	err = xone_dongle_power_off_clients(dongle);
 	if (err)
 		dev_err(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
+
+	xone_dongle_stop_on_unload(dongle, "shutdown");
 }
 
 static int xone_dongle_pre_reset(struct usb_interface *intf)

@@ -85,6 +85,10 @@ static int fix_wlan_reset = 1;
 module_param(fix_wlan_reset, int, 0644);
 MODULE_PARM_DESC(fix_wlan_reset, "Warm start: reset and power up the WLAN block before the firmware upload (0=off, 1=on, 2=random)");
 
+static int fix_wcid_reset = 1;
+module_param(fix_wcid_reset, int, 0644);
+MODULE_PARM_DESC(fix_wcid_reset, "At every radio init: clear client slots (address, key) left in the chip from before (0=off, 1=on, 2=random)");
+
 bool xone_fix_pick(int setting)
 {
 	if (setting == 2)
@@ -1291,9 +1295,82 @@ static u16 xone_mt76_get_chip_id(struct xone_mt76 *mt)
 	return (id[1] << 8) | id[2];
 }
 
+/* stop receiving (like mainline mt76x2u_mac_stop() on cleanup) */
+void xone_mt76_stop_rx(struct xone_mt76 *mt)
+{
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+}
+
+#define XONE_MT_CLIENT_SLOTS 17	/* client wcid 1..16, plus 0 (firmware uses wcid - 1) */
+
+/* client slots holding a pairwise key (count) and an address (*addrs) */
+static int xone_mt76_count_client_slots(struct xone_mt76 *mt, int *addrs)
+{
+	int i, keys = 0;
+	u32 attr;
+
+	*addrs = 0;
+	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
+		attr = xone_mt76_read_register(mt, MT_WCID_ATTR(i));
+		if (attr & (MT_WCID_ATTR_PKEY_MODE | MT_WCID_ATTR_PAIRWISE))
+			keys++;
+		if (xone_mt76_read_register(mt, MT_WCID_ADDR(i)) ||
+		    (xone_mt76_read_register(mt, MT_WCID_ADDR(i) + 4) & 0xffff))
+			(*addrs)++;
+	}
+
+	return keys;
+}
+
+/*
+ * Mainline mt76x2u_init_hardware() resets the whole WCID and key tables at
+ * every init ("reset wcid table", "reset shared key table and pairwise key
+ * table"). xone only clears a slot when a controller disconnects cleanly, so
+ * after a reboot, resume or crash a slot can keep an old address and an old
+ * pairwise key; a controller that reconnects into it only gets its address
+ * rewritten (xone_mt76_associate_client()).
+ */
+static void xone_mt76_reset_client_slots(struct xone_mt76 *mt,
+					 int keys_at_start, int addrs_at_start)
+{
+	u8 addr[8] = {}, iv[8] = {}, key[XONE_MT_WCID_KEY_LEN] = {};
+	__le32 attr = 0;
+	int i, keys, addrs;
+
+	keys = xone_mt76_count_client_slots(mt, &addrs);
+
+	if (keys_at_start || addrs_at_start || keys || addrs)
+		dev_info(mt->dev,
+			 "xone-fix: radio init: client slots left from before: %d with key, %d with address (after register init: %d / %d)\n",
+			 keys_at_start, addrs_at_start, keys, addrs);
+
+	if (!keys && !addrs)
+		return;
+
+	if (!xone_fix_pick(fix_wcid_reset)) {
+		dev_info(mt->dev,
+			 "xone-fix: radio init: client slots not cleared (fix_wcid_reset off)\n");
+		return;
+	}
+
+	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
+		xone_mt76_write_burst(mt, MT_WCID_ATTR(i), &attr, sizeof(attr));
+		xone_mt76_write_burst(mt, MT_WCID_KEY(i), key, sizeof(key));
+		xone_mt76_write_burst(mt, MT_WCID_IV(i), iv, sizeof(iv));
+		xone_mt76_write_burst(mt, MT_WCID_ADDR(i), addr, sizeof(addr));
+	}
+
+	keys = xone_mt76_count_client_slots(mt, &addrs);
+	dev_info(mt->dev,
+		 "xone-fix: radio init: client slots cleared (now %d with key, %d with address)\n",
+		 keys, addrs);
+}
+
 int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
-	int err;
+	int err, keys_at_start, addrs_at_start;
+
+	keys_at_start = xone_mt76_count_client_slots(mt, &addrs_at_start);
 
 	dev_dbg(mt->dev, "%s: id=0x%04x\n", __func__,
 		xone_mt76_get_chip_id(mt));
@@ -1311,6 +1388,7 @@ int xone_mt76_init_radio(struct xone_mt76 *mt)
 		return err;
 
 	xone_mt76_init_registers(mt);
+	xone_mt76_reset_client_slots(mt, keys_at_start, addrs_at_start);
 
 	err = xone_mt76_calibrate_crystal(mt);
 	if (err)
