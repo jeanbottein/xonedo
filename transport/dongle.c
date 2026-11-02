@@ -59,6 +59,8 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
+	/* channel to go back to if this client retries its association */
+	u8 hop_back_idx;
 
 	struct gip_adapter *adapter;
 };
@@ -96,6 +98,9 @@ struct xone_dongle {
 	bool pairing;
 	unsigned long last_wlan_rx;
 	u8 pairing_scan_idx;
+	/* last pairing-scan hop between channels of the same wide channel */
+	unsigned long hop_time;
+	u8 hop_prev_idx;
 
 	/* serializes access to clients array */
 	spinlock_t clients_lock;
@@ -125,6 +130,46 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 	}
 
 	return 0;
+}
+
+#define XONE_DONGLE_HOP_NONE 0xff
+#define XONE_DONGLE_HOP_GRACE msecs_to_jiffies(500)
+
+/*
+ * 5 GHz channels used as one 40/80 MHz channel: 36/40, 44/48 and 149-161.
+ * After a hop between two of them the dongle still hears a controller that
+ * is on the previous primary channel, but answers on the new one.
+ */
+static bool xone_dongle_same_block(u8 a, u8 b)
+{
+	if (a < 36 || b < 36)
+		return false;
+
+	if (a >= 149 && b >= 149)
+		return a <= 161 && b <= 161;
+
+	if (a < 149 && b < 149)
+		return (a - 36) / 8 == (b - 36) / 8;
+
+	return false;
+}
+
+static void xone_dongle_hop_back(struct xone_dongle *dongle, u8 idx)
+{
+	struct xone_mt76_channel *chan = &dongle->mt.channels[idx];
+	int err;
+
+	mutex_lock(&dongle->pairing_lock);
+	err = xone_mt76_switch_channel(&dongle->mt, chan);
+	if (!err) {
+		dongle->mt.channel = chan;
+		dongle->pairing_scan_idx = idx;
+	}
+	mutex_unlock(&dongle->pairing_lock);
+
+	dev_dbg(dongle->mt.dev,
+		"%s: client retried right after a hop, back to channel %u: %d\n",
+		__func__, chan->index, err);
 }
 
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
@@ -283,6 +328,7 @@ static int xone_dongle_pairing_handler(struct xone_dongle *dongle, bool enable,
 	if (enable) {
 		dongle->last_wlan_rx = jiffies;
 		dongle->pairing_scan_idx = xone_dongle_find_channel_idx(dongle);
+		dongle->hop_prev_idx = XONE_DONGLE_HOP_NONE;
 		mod_delayed_work(system_wq, &dongle->pairing_work,
 				 msecs_to_jiffies(timeout_secs * 1000));
 		mod_delayed_work(system_wq, &dongle->pairing_scan_work,
@@ -369,6 +415,13 @@ static void xone_dongle_pairing_scan(struct work_struct *work)
 		dev_dbg(dongle->mt.dev,
 			"%s: channel switch %u -> %u\n",
 			__func__, prev_chan, next_chan);
+
+		if (xone_dongle_same_block(prev_chan, next_chan)) {
+			dongle->hop_prev_idx = dongle->pairing_scan_idx;
+			dongle->hop_time = jiffies;
+		} else {
+			dongle->hop_prev_idx = XONE_DONGLE_HOP_NONE;
+		}
 	}
 
 	dongle->pairing_scan_idx = next_idx;
@@ -525,15 +578,37 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	 * because our association response got lost, so send it again
 	 * instead of allocating a second slot.
 	 */
-	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
-		if (dongle->clients[i] &&
-		    ether_addr_equal(dongle->clients[i]->address, addr))
-			return xone_mt76_associate_client(&dongle->mt,
-							  i + 1, addr);
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		client = dongle->clients[i];
+		if (!client || !ether_addr_equal(client->address, addr))
+			continue;
+
+		/*
+		 * It associated right after a hop inside a wide channel and
+		 * missed our response: it is still on the previous primary
+		 * channel. Go back there once.
+		 */
+		if (client->hop_back_idx != XONE_DONGLE_HOP_NONE) {
+			xone_dongle_hop_back(dongle, client->hop_back_idx);
+			client->hop_back_idx = XONE_DONGLE_HOP_NONE;
+		}
+
+		return xone_mt76_associate_client(&dongle->mt, i + 1, addr);
+	}
 
 	client = xone_dongle_create_client(dongle, addr);
 	if (IS_ERR(client))
 		return PTR_ERR(client);
+
+	client->hop_back_idx = XONE_DONGLE_HOP_NONE;
+	if (dongle->hop_prev_idx != XONE_DONGLE_HOP_NONE &&
+	    time_before(jiffies, dongle->hop_time + XONE_DONGLE_HOP_GRACE)) {
+		client->hop_back_idx = dongle->hop_prev_idx;
+		dev_dbg(dongle->mt.dev,
+			"%s: association %u ms after a hop from channel %u\n",
+			__func__, jiffies_to_msecs(jiffies - dongle->hop_time),
+			dongle->mt.channels[client->hop_back_idx].index);
+	}
 
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
 	if (err)
