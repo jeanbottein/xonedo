@@ -59,6 +59,8 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
+	int assoc_retries;
+	bool connected;
 
 	struct gip_adapter *adapter;
 };
@@ -109,6 +111,9 @@ struct xone_dongle {
 	enum xone_dongle_fw_state fw_state;
 	u16 vendor;
 	u16 product;
+
+	/* last reset requested by the driver itself (0 = never) */
+	unsigned long self_reset_time;
 };
 
 static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index, bool silent);
@@ -135,6 +140,40 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 static bool xone_dongle_wants_pairing_scan(struct xone_dongle *dongle)
 {
 	return dongle->product != 0x02e6;
+}
+
+/*
+ * A firmware session that ignores our writes was only ever cured by a USB
+ * reset. It drops every client, so never while one is connected, and at most
+ * once a minute so it can't loop.
+ */
+static bool xone_dongle_self_reset(struct xone_dongle *dongle,
+				   const char *why)
+{
+	unsigned long flags;
+	int i, connected = 0;
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
+		if (dongle->clients[i] && dongle->clients[i]->connected)
+			connected++;
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+
+	if (connected) {
+		dev_warn(dongle->mt.dev, "%s: not resetting, %d client(s) connected\n",
+			 why, connected);
+		return false;
+	}
+
+	if (dongle->self_reset_time &&
+	    time_before(jiffies, dongle->self_reset_time + 60 * HZ))
+		return false;
+
+	dongle->self_reset_time = jiffies | 1;
+	dev_warn(dongle->mt.dev, "%s: resetting the dongle\n", why);
+	usb_queue_reset_device(to_usb_interface(dongle->mt.dev));
+
+	return true;
 }
 
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
@@ -536,19 +575,35 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	 * because our association response got lost, so send it again
 	 * instead of allocating a second slot.
 	 */
-	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
-		if (dongle->clients[i] &&
-		    ether_addr_equal(dongle->clients[i]->address, addr))
-			return xone_mt76_associate_client(&dongle->mt,
-							  i + 1, addr);
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		client = dongle->clients[i];
+		if (!client || !ether_addr_equal(client->address, addr))
+			continue;
+
+		/* safety net for anything else that leaves a client stuck */
+		if (++client->assoc_retries == 3 &&
+		    xone_dongle_self_reset(dongle, "client still can't connect"))
+			return 0;
+
+		err = xone_mt76_associate_client(&dongle->mt, i + 1, addr);
+		if (err == -EIO &&
+		    xone_dongle_self_reset(dongle, "firmware ignored the client address"))
+			return 0;
+
+		return err;
+	}
 
 	client = xone_dongle_create_client(dongle, addr);
 	if (IS_ERR(client))
 		return PTR_ERR(client);
 
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
-	if (err)
+	if (err) {
+		if (err == -EIO &&
+		    xone_dongle_self_reset(dongle, "firmware ignored the client address"))
+			err = 0;
 		goto err_free_client;
+	}
 
 	if (!dongle->pairing) {
 		err = xone_mt76_set_led_mode(&dongle->mt, XONE_MT_LED_ON);
@@ -727,6 +782,7 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		 */
 		if (dongle->pairing)
 			dongle->last_wlan_rx = jiffies;
+		client->connected = true;
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
 	}
 
