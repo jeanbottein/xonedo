@@ -66,6 +66,7 @@ struct xone_mt76 {
 };
 
 void xone_mt76_stop_rx(struct xone_mt76 *mt);
+void xone_mt76_log_client_slots(struct xone_mt76 *mt);
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
 void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd);
