@@ -59,7 +59,7 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
-	/* other channel of the wide channel to try if this client retries */
+	/* other channel to try if this client retries (before/after a hop) */
 	u8 hop_back_idx;
 	int hop_flips;
 	/* connection timing, logged with the first data from the client */
@@ -103,7 +103,7 @@ struct xone_dongle {
 	bool pairing;
 	unsigned long last_wlan_rx;
 	u8 pairing_scan_idx;
-	/* last pairing-scan hop between channels of the same wide channel */
+	/* last pairing-scan hop: channel before it and when */
 	unsigned long hop_time;
 	u8 hop_prev_idx;
 
@@ -143,24 +143,12 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 #define XONE_DONGLE_HOP_MAX_FLIPS 4
 
 /*
- * 5 GHz channels used as one 40/80 MHz channel: 36/40, 44/48 and 149-161.
- * After a hop between two of them the dongle still hears a controller that
- * is on the previous primary channel, but answers on the new one.
+ * The dongle hears a controller on the channel it just left (the 40/80 MHz
+ * channels overlap: xone uses 40 with 44, for example), but answers on the
+ * new one, which the controller never hears. A controller that sends its
+ * association request shortly after a hop is most likely still on the
+ * previous channel.
  */
-static bool xone_dongle_same_block(u8 a, u8 b)
-{
-	if (a < 36 || b < 36)
-		return false;
-
-	if (a >= 149 && b >= 149)
-		return a <= 161 && b <= 161;
-
-	if (a < 149 && b < 149)
-		return (a - 36) / 8 == (b - 36) / 8;
-
-	return false;
-}
-
 static void xone_dongle_hop_back(struct xone_dongle *dongle, u8 idx)
 {
 	struct xone_mt76_channel *chan = &dongle->mt.channels[idx];
@@ -423,12 +411,8 @@ static void xone_dongle_pairing_scan(struct work_struct *work)
 			"%s: channel switch %u -> %u\n",
 			__func__, prev_chan, next_chan);
 
-		if (xone_dongle_same_block(prev_chan, next_chan)) {
-			dongle->hop_prev_idx = dongle->pairing_scan_idx;
-			dongle->hop_time = jiffies;
-		} else {
-			dongle->hop_prev_idx = XONE_DONGLE_HOP_NONE;
-		}
+		dongle->hop_prev_idx = dongle->pairing_scan_idx;
+		dongle->hop_time = jiffies;
 	}
 
 	dongle->pairing_scan_idx = next_idx;
