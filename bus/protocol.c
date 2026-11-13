@@ -1163,6 +1163,15 @@ static int gip_handle_pkt_announce(struct gip_client *client,
 		hw->product = le16_to_cpu(pkt->product_id);
 		hw->version = (le16_to_cpu(pkt->fw_version.major) << 8) |
 			      le16_to_cpu(pkt->fw_version.minor);
+
+		hw->fw_version[0] = le16_to_cpu(pkt->fw_version.major);
+		hw->fw_version[1] = le16_to_cpu(pkt->fw_version.minor);
+		hw->fw_version[2] = le16_to_cpu(pkt->fw_version.build);
+		hw->fw_version[3] = le16_to_cpu(pkt->fw_version.revision);
+		hw->hw_version[0] = le16_to_cpu(pkt->hw_version.major);
+		hw->hw_version[1] = le16_to_cpu(pkt->hw_version.minor);
+		hw->hw_version[2] = le16_to_cpu(pkt->hw_version.build);
+		hw->hw_version[3] = le16_to_cpu(pkt->hw_version.revision);
 	}
 
 	gip_dbg(client, "%s: address=%pM, vendor=0x%04x, product=0x%04x\n",
@@ -1387,11 +1396,15 @@ static int gip_handle_pkt_audio_volume_chat(struct gip_client *client,
 	if (len != sizeof(*pkt))
 		return -EINVAL;
 
+	gip_dbg(client, "%s: mute=0x%02x in=%u out=%u\n", __func__,
+		pkt->mute, pkt->in, pkt->out);
+
 	if (down_trylock(&client->drv_lock))
 		return -EBUSY;
 
 	if (client->drv && client->drv->ops.audio_volume)
-		err = client->drv->ops.audio_volume(client, pkt->in, pkt->out);
+		err = client->drv->ops.audio_volume(client, pkt->in, pkt->out,
+						    pkt->mute == GIP_AUD_VOLUME_MIC_MUTED);
 
 	up(&client->drv_lock);
 
@@ -1449,11 +1462,15 @@ static int gip_handle_pkt_audio_volume(struct gip_client *client,
 	if (len != sizeof(*pkt))
 		return -EINVAL;
 
+	gip_dbg(client, "%s: mute=0x%02x in=%u out=%u\n", __func__,
+		pkt->mute, pkt->in, pkt->out);
+
 	if (down_trylock(&client->drv_lock))
 		return -EBUSY;
 
 	if (client->drv && client->drv->ops.audio_volume)
-		err = client->drv->ops.audio_volume(client, pkt->in, pkt->out);
+		err = client->drv->ops.audio_volume(client, pkt->in, pkt->out,
+						    pkt->mute == GIP_AUD_VOLUME_MIC_MUTED);
 
 	up(&client->drv_lock);
 

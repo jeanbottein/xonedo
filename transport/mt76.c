@@ -19,6 +19,7 @@
 
 #define XONE_MT_RF_PATCH 0x0130
 #define XONE_MT_FW_LOAD_IVB 0x12
+#define XONE_MT_MCU_RESET 0x01
 #define XONE_MT_FW_ILM_OFFSET 0x080000
 #define XONE_MT_FW_DLM_OFFSET 0x110800
 #define XONE_MT_FW_CHUNK_SIZE 0x3800
@@ -211,18 +212,77 @@ void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd)
 			       FIELD_PREP(MT_MCU_MSG_CMD_TYPE, cmd));
 }
 
+/*
+ * Debug experiment: number every MCU command (seq 1..15, like mainline
+ * __mt76x02u_mcu_send_msg()) so the firmware answers it, and track the
+ * answers (xone_mt76_mcu_answer()). Command type 0 (firmware upload chunks,
+ * client packets) keeps seq 0.
+ */
 static int xone_mt76_send_command(struct xone_mt76 *mt, struct sk_buff *skb,
 				  enum mt76_mcu_cmd cmd)
 {
-	int err;
+	int err, seq = 0;
 
-	xone_mt76_prep_command(skb, cmd);
+	if (cmd) {
+		do {
+			seq = atomic_inc_return(&mt->mcu_seq) & 0xf;
+		} while (!seq);
+
+		if (atomic_fetch_or(BIT(seq), &mt->mcu_pending) & BIT(seq)) {
+			mt->mcu_lost++;
+			dev_info_ratelimited(mt->dev,
+					     "xone-fix: MCU command %u (seq %d) never answered\n",
+					     mt->mcu_cmd[seq], seq);
+		}
+
+		mt->mcu_cmd[seq] = cmd;
+		mt->mcu_last_seq = seq;
+		mt->mcu_sent++;
+	}
+
+	if (atomic_inc_return(&mt->mcu_inflight) > 1) {
+		mt->mcu_overlaps++;
+		dev_info_ratelimited(mt->dev,
+				     "xone-fix: MCU command %u sent while another was being sent\n",
+				     cmd);
+	}
+
+	xone_mt76_prep_message(skb, MT_MCU_MSG_TYPE_CMD |
+			       FIELD_PREP(MT_MCU_MSG_PORT, MT_CPU_TX_PORT) |
+			       FIELD_PREP(MT_MCU_MSG_CMD_TYPE, cmd) |
+			       FIELD_PREP(MT_MCU_MSG_CMD_SEQ, seq));
 
 	err = usb_bulk_msg(mt->udev, usb_sndbulkpipe(mt->udev, XONE_MT_EP_OUT),
 			   skb->data, skb->len, NULL, XONE_MT_USB_TIMEOUT);
+	atomic_dec(&mt->mcu_inflight);
 	consume_skb(skb);
 
 	return err;
+}
+
+/* debug: an answer from the firmware to a numbered command */
+void xone_mt76_mcu_answer(struct xone_mt76 *mt, u32 info)
+{
+	u8 seq = FIELD_GET(MT_RX_FCE_INFO_CMD_SEQ, info);
+	u8 evt = FIELD_GET(MT_RX_FCE_INFO_EVT_TYPE, info);
+
+	atomic_andnot(BIT(seq), &mt->mcu_pending);
+	mt->mcu_answered++;
+
+	if (evt) {
+		mt->mcu_errors++;
+		dev_info_ratelimited(mt->dev,
+				     "xone-fix: MCU command %u (seq %d) answered with event %u (0 = done, 1 = error, 2 = retry)\n",
+				     mt->mcu_cmd[seq], seq, evt);
+	}
+}
+
+static void xone_mt76_log_mcu_stats(struct xone_mt76 *mt, const char *when)
+{
+	dev_info(mt->dev,
+		 "xone-fix: MCU stats (%s): sent %u, answered %u, error/retry %u, never answered %u, overlaps %u\n",
+		 when, mt->mcu_sent, mt->mcu_answered, mt->mcu_errors,
+		 mt->mcu_lost, mt->mcu_overlaps);
 }
 
 static int xone_mt76_send_wlan(struct xone_mt76 *mt, struct sk_buff *skb)
@@ -441,8 +501,13 @@ static int xone_mt76_send_firmware_part(struct xone_mt76 *mt, u32 offset,
 
 		complete = 0xc0000000 | (chunk_len << 16);
 		if (!xone_mt76_poll(mt, MT_FCE_DMA_LEN | MT_VEND_TYPE_CFG,
-				    0xffffffff, complete))
+				    0xffffffff, complete)) {
+			dev_err(mt->dev, "%s: chunk at 0x%x not done: DMA_LEN=0x%08x\n",
+				__func__, offset + pos,
+				xone_mt76_read_register(mt, MT_FCE_DMA_LEN |
+							MT_VEND_TYPE_CFG));
 			return -ETIMEDOUT;
+		}
 	}
 
 	return 0;
@@ -490,46 +555,238 @@ static int xone_mt76_send_firmware(struct xone_mt76 *mt,
 					    dlm_len);
 }
 
-static int xone_mt76_reset_firmware(struct xone_mt76 *mt)
+static void xone_mt76_rmw(struct xone_mt76 *mt, u32 addr, u32 clear, u32 set)
+{
+	u32 val = xone_mt76_read_register(mt, addr);
+
+	xone_mt76_write_register(mt, addr, (val & ~clear) | set);
+}
+
+#define XONE_MT_CFG(addr) ((addr) | MT_VEND_TYPE_CFG)
+#define xone_mt76_set(mt, addr, bits) xone_mt76_rmw(mt, addr, 0, bits)
+#define xone_mt76_clear(mt, addr, bits) xone_mt76_rmw(mt, addr, bits, 0)
+
+/* same steps as mainline mt76x2_reset_wlan(dev, true) */
+static void xone_mt76_reset_wlan(struct xone_mt76 *mt)
+{
+	u32 val = xone_mt76_read_register(mt, MT_WLAN_FUN_CTRL);
+
+	val &= ~MT_WLAN_FUN_CTRL_FRC_WL_ANT_SEL;
+
+	if (val & MT_WLAN_FUN_CTRL_WLAN_EN) {
+		xone_mt76_write_register(mt, MT_WLAN_FUN_CTRL,
+					 val | MT_WLAN_FUN_CTRL_WLAN_RESET_RF);
+		udelay(20);
+	}
+
+	xone_mt76_write_register(mt, MT_WLAN_FUN_CTRL, val);
+	udelay(20);
+
+	xone_mt76_write_register(mt, MT_WLAN_FUN_CTRL,
+				 val | MT_WLAN_FUN_CTRL_WLAN_EN |
+				 MT_WLAN_FUN_CTRL_WLAN_CLK_EN);
+	udelay(20);
+}
+
+/* same steps as mainline mt76x2u_power_on_rf() + mt76x2u_power_on_rf_patch() */
+static void xone_mt76_power_on_rf(struct xone_mt76 *mt, int unit)
+{
+	int shift = unit ? 8 : 0;
+
+	/* enable RF BG */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130), BIT(0) << shift);
+	usleep_range(10, 20);
+
+	/* enable RFDIG LDO/AFE/ABB/ADDA */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130),
+		      (BIT(1) | BIT(3) | BIT(4) | BIT(5)) << shift);
+	usleep_range(10, 20);
+
+	/* switch RFDIG power to internal LDO */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0130), BIT(2) << shift);
+	usleep_range(10, 20);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130), BIT(0) | BIT(16));
+	udelay(1);
+
+	xone_mt76_clear(mt, XONE_MT_CFG(0x001c), 0xff);
+	xone_mt76_set(mt, XONE_MT_CFG(0x001c), 0x30);
+
+	xone_mt76_write_register(mt, XONE_MT_CFG(0x0014), 0x484f);
+	udelay(1);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x0130), BIT(17));
+	usleep_range(150, 200);
+
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0130), BIT(16));
+	usleep_range(50, 100);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x014c), BIT(19) | BIT(20));
+
+	xone_mt76_set(mt, 0x0530, 0x0f);
+}
+
+/* same steps as mainline mt76x2u_power_on() */
+static void xone_mt76_power_on(struct xone_mt76 *mt)
+{
+	u32 ack = MT_WLAN_MTC_CTRL_STATE_UP | MT_WLAN_MTC_CTRL_PWR_ACK |
+		  MT_WLAN_MTC_CTRL_PWR_ACK_S;
+
+	/* turn on WL MTCMOS */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0148), MT_WLAN_MTC_CTRL_MTCMOS_PWR_UP);
+
+	if (!xone_mt76_poll(mt, XONE_MT_CFG(0x0148), ack, ack))
+		dev_dbg(mt->dev, "%s: no MTCMOS power ack\n", __func__);
+
+	/* power up the BBP/PBF/FCE/TSO memories and pulse their reset */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0148), 0x7f << 16);
+	usleep_range(10, 20);
+
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0148), 0xf << 24);
+	usleep_range(10, 20);
+
+	xone_mt76_set(mt, XONE_MT_CFG(0x0148), 0xf << 24);
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0148), 0xfff);
+
+	/* turn on AD/DA power down */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x1204), BIT(3));
+
+	/* WLAN function enable */
+	xone_mt76_set(mt, XONE_MT_CFG(0x0080), BIT(0));
+
+	/* release BBP software reset */
+	xone_mt76_clear(mt, XONE_MT_CFG(0x0064), BIT(18));
+
+	xone_mt76_power_on_rf(mt, 0);
+	xone_mt76_power_on_rf(mt, 1);
+}
+
+/* same as mainline mt76x02_wait_for_mac() */
+static int xone_mt76_wait_for_mac(struct xone_mt76 *mt)
 {
 	u32 val;
+	int i;
+
+	for (i = 0; i < 100; i++) {
+		val = xone_mt76_read_register(mt, MT_MAC_CSR0);
+		if (val && val != ~0U)
+			return 0;
+
+		usleep_range(5000, 10000);
+	}
+
+	return -ETIMEDOUT;
+}
+
+#define XONE_MT_DRAIN_LEN 0x10000
+
+/* read and drop what the chip still holds for the host on one endpoint */
+static int xone_mt76_drain_ep(struct xone_mt76 *mt, u8 ep, void *buf,
+			      int *packets)
+{
+	int i, err, actual, total = 0;
+
+	for (i = 0; i < 512; i++) {
+		actual = 0;
+		err = usb_bulk_msg(mt->udev, usb_rcvbulkpipe(mt->udev, ep),
+				   buf, XONE_MT_DRAIN_LEN, &actual, 20);
+		total += actual;
+		if (err)
+			break;
+	}
+
+	*packets += i;
+	return total;
+}
+
+/*
+ * A warm chip still has the old firmware receiving, and nobody read the RX
+ * endpoints since the driver went away: the leftover traffic made the
+ * firmware upload stall (FCE_DMA_LEN never done), after which the dongle
+ * stopped answering on USB until a replug. Stop RX/TX and read it out, as
+ * mainline mt76x2u_mac_stop() waits for the RX queues to drain.
+ */
+static int xone_mt76_quiesce(struct xone_mt76 *mt)
+{
+	int bytes, packets = 0;
+	void *buf;
+
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+	msleep(20);
+
+	buf = kmalloc(XONE_MT_DRAIN_LEN, GFP_KERNEL);
+	if (!buf)
+		return 0;
+
+	bytes = xone_mt76_drain_ep(mt, XONE_MT_EP_IN_WLAN, buf, &packets);
+	bytes += xone_mt76_drain_ep(mt, XONE_MT_EP_IN_CMD, buf, &packets);
+	kfree(buf);
+
+	if (bytes)
+		dev_info(mt->dev,
+			 "xone-fix: warm start: read out %d packets (%d bytes) of leftover radio data before the firmware upload\n",
+			 packets, bytes);
+	else
+		dev_info(mt->dev, "xone-fix: warm start: no leftover radio data\n");
+
+	return packets;
+}
+
+/*
+ * A warm chip keeps its RF state and BBP/PBF/FCE/TSO memories through an MCU
+ * reset. MediaTek's reference driver and mainline mt76x2 reset them at every
+ * probe and resume (mt76x2u_init_hardware()); xone, written from captures of
+ * a cold start, never did.
+ */
+static int xone_mt76_reset_wlan_hw(struct xone_mt76 *mt)
+{
+	xone_mt76_reset_wlan(mt);
+	xone_mt76_power_on(mt);
+
+	return xone_mt76_wait_for_mac(mt);
+}
+
+static int xone_mt76_reset_firmware(struct xone_mt76 *mt)
+{
 	int err;
 
-	/* apply power-on RF patch */
-	val = xone_mt76_read_register(mt, XONE_MT_RF_PATCH | MT_VEND_TYPE_CFG);
-	xone_mt76_write_register(mt, XONE_MT_RF_PATCH | MT_VEND_TYPE_CFG,
-				 val & ~BIT(19));
-
-	err = xone_mt76_load_ivb(mt);
-	if (err)
+	/*
+	 * Reset the MCU back to ROM, like mainline mt76x02u_mcu_fw_reset().
+	 * Restarting the firmware left in RAM skips the USB DMA and FCE setup
+	 * done by a full load, so do a full load afterwards.
+	 */
+	err = usb_control_msg(mt->udev, usb_sndctrlpipe(mt->udev, 0),
+			      MT_VEND_DEV_MODE, USB_DIR_OUT | USB_TYPE_VENDOR,
+			      XONE_MT_MCU_RESET, 0, NULL, 0,
+			      XONE_MT_USB_TIMEOUT);
+	if (err < 0)
 		return err;
 
-	/* wait for reset */
-	if (!xone_mt76_poll(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG,
-			    0x80000000, 0x80000000))
-		return -ETIMEDOUT;
+	usleep_range(5000, 10000);
 
 	return 0;
 }
 
-int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
+static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
+				     const struct firmware *fw, bool *warm,
+				     u32 *rx_pages, int *leftover)
 {
 	u32 val;
 	int err;
 
 	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
+		*warm = true;
+		*rx_pages = xone_mt76_read_register(mt, 0x0a30);
+		*leftover = xone_mt76_quiesce(mt);
+
+		err = xone_mt76_reset_wlan_hw(mt);
+		if (err)
+			return err;
+
 		err = xone_mt76_reset_firmware(mt);
 		if (err)
 			return err;
-		/*
-		 * The MCU needs time to complete its startup sequence after the
-		 * firmware reset before it can handle the bulk USB commands sent
-		 * by xone_mt76_init_radio(). Without this delay init_radio
-		 * reliably times out (-ETIMEDOUT) on warm reboot.
-		 */
-		msleep(500);
-		return 0;
 	}
 
 	dev_dbg(mt->dev, "%s: loading firmware...\n", __func__);
@@ -573,6 +830,31 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 
 	if (!xone_mt76_poll(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG, 0x01, 0x01))
 		err = -ETIMEDOUT;
+
+	return err;
+}
+
+/* debug: one xone-fix line per firmware load (warm/cold, leftover, outcome) */
+int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
+{
+	bool warm = false;
+	u32 rx_pages = 0;
+	int leftover = 0, err;
+
+	err = __xone_mt76_load_firmware(mt, fw, &warm, &rx_pages, &leftover);
+
+	if (warm && !err)
+		dev_info(mt->dev, "xone-fix: warm start: fresh firmware uploaded\n");
+
+	if (warm)
+		dev_info(mt->dev,
+			 "xone-fix: firmware load attempt %d: warm rx_pages=0x%x leftover=%d pkts -> %s (%d)\n",
+			 mt->fw_attempt, rx_pages, leftover,
+			 err ? "FAILED" : "ok", err);
+	else
+		dev_info(mt->dev,
+			 "xone-fix: firmware load attempt %d: cold -> %s (%d)\n",
+			 mt->fw_attempt, err ? "FAILED" : "ok", err);
 
 	return err;
 }
@@ -970,9 +1252,85 @@ static u16 xone_mt76_get_chip_id(struct xone_mt76 *mt)
 	return (id[1] << 8) | id[2];
 }
 
+#define XONE_MT_CLIENT_SLOTS 17	/* client wcid 1..16, plus 0 (firmware uses wcid - 1) */
+
+/* client slots holding a pairwise key (count) and an address (*addrs) */
+static int xone_mt76_count_client_slots(struct xone_mt76 *mt, int *addrs)
+{
+	int i, keys = 0;
+	u32 attr;
+
+	*addrs = 0;
+	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
+		attr = xone_mt76_read_register(mt, MT_WCID_ATTR(i));
+		if (attr & (MT_WCID_ATTR_PKEY_MODE | MT_WCID_ATTR_PAIRWISE))
+			keys++;
+		if (xone_mt76_read_register(mt, MT_WCID_ADDR(i)) ||
+		    (xone_mt76_read_register(mt, MT_WCID_ADDR(i) + 4) & 0xffff))
+			(*addrs)++;
+	}
+
+	return keys;
+}
+
+/*
+ * Mainline resets the WCID and key tables at every init; xone only clears a
+ * slot on a clean disconnect, and its register init doesn't clear them (seen:
+ * 16 slots with a key mode left after a driver reload). A controller that
+ * reconnects into such a slot only gets its address rewritten.
+ */
+static void xone_mt76_reset_client_slots(struct xone_mt76 *mt, int keys,
+					 int addrs)
+{
+	u8 addr[8] = {}, iv[8] = {}, key[XONE_MT_WCID_KEY_LEN] = {};
+	__le32 attr = 0;
+	int i;
+
+	if (!keys && !addrs)
+		return;
+
+	dev_info(mt->dev,
+		 "xone-fix: radio init: client slots left from before: %d with key, %d with address: cleared\n",
+		 keys, addrs);
+
+	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
+		xone_mt76_write_burst(mt, MT_WCID_ATTR(i), &attr, sizeof(attr));
+		xone_mt76_write_burst(mt, MT_WCID_KEY(i), key, sizeof(key));
+		xone_mt76_write_burst(mt, MT_WCID_IV(i), iv, sizeof(iv));
+		xone_mt76_write_burst(mt, MT_WCID_ADDR(i), addr, sizeof(addr));
+	}
+}
+
+/* debug: which WCID slots hold an address, and their attributes */
+void xone_mt76_log_client_slots(struct xone_mt76 *mt)
+{
+	u32 lo, hi;
+	int i;
+
+	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
+		lo = xone_mt76_read_register(mt, MT_WCID_ADDR(i));
+		hi = xone_mt76_read_register(mt, MT_WCID_ADDR(i) + 4) & 0xffff;
+		if (!lo && !hi)
+			continue;
+
+		dev_info(mt->dev,
+			 "xone-fix: chip slot %d: address %02x:%02x:%02x:%02x:%02x:%02x attr=0x%08x\n",
+			 i, lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff,
+			 lo >> 24, hi & 0xff, hi >> 8,
+			 xone_mt76_read_register(mt, MT_WCID_ATTR(i)));
+	}
+}
+
+void xone_mt76_stop_rx(struct xone_mt76 *mt)
+{
+	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
+}
+
 int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
-	int err;
+	int err, stale_keys, stale_addrs;
+
+	stale_keys = xone_mt76_count_client_slots(mt, &stale_addrs);
 
 	dev_dbg(mt->dev, "%s: id=0x%04x\n", __func__,
 		xone_mt76_get_chip_id(mt));
@@ -990,6 +1348,7 @@ int xone_mt76_init_radio(struct xone_mt76 *mt)
 		return err;
 
 	xone_mt76_init_registers(mt);
+	xone_mt76_reset_client_slots(mt, stale_keys, stale_addrs);
 
 	err = xone_mt76_calibrate_crystal(mt);
 	if (err)
@@ -1075,9 +1434,32 @@ int xone_mt76_resume_radio(struct xone_mt76 *mt)
 	if (err)
 		return err;
 
+	/*
+	 * The RF front end does not survive a system suspend: the MCU leaves
+	 * MT_RADIO_ON and the RXDCOC/RC/temperature calibrations applied by
+	 * init_radio() are lost. The MAC layer does survive, so the dongle
+	 * still beacons and a controller still associates - but an
+	 * uncalibrated RF path cannot sustain the link, so it collapses a few
+	 * seconds later and the controller reassociates every ~10s forever.
+	 *
+	 * Restore the radio power mode and redo the calibration, mirroring
+	 * init_radio(). calibrate_radio() leaves MT_MAC_SYS_CTRL with RX and
+	 * TX enabled; it is re-applied below after the channel switch.
+	 */
+	err = xone_mt76_set_power_mode(mt, MT_RADIO_ON);
+	if (err)
+		return err;
+
+	err = xone_mt76_calibrate_radio(mt);
+	if (err)
+		return err;
+
 	err = xone_mt76_switch_channel(mt, mt->channel);
 	if (err)
 		return err;
+
+	/* mandatory delay after channel change */
+	msleep(1000);
 
 	err = xone_mt76_set_pairing(mt, false);
 	if (err)
@@ -1199,6 +1581,68 @@ int xone_mt76_pair_client(struct xone_mt76 *mt, u8 *addr)
 	return xone_mt76_send_wlan(mt, skb);
 }
 
+static bool xone_mt76_client_addr_is(struct xone_mt76 *mt, u8 wcid,
+				     const u8 *addr)
+{
+	u8 cur[8];
+
+	put_unaligned_le32(xone_mt76_read_register(mt, MT_WCID_ADDR(wcid)), cur);
+	put_unaligned_le32(xone_mt76_read_register(mt, MT_WCID_ADDR(wcid) + 4),
+			   cur + 4);
+
+	return !memcmp(cur, addr, ETH_ALEN);
+}
+
+/*
+ * The firmware must get the client's address through its burst write (a
+ * direct register write lets frames in, but the GIP handshake never goes on).
+ * That command is not acknowledged, and in some firmware sessions it is
+ * ignored until a USB reset: the client's frames then all come in as WCID
+ * 0xff and are dropped. Check, write again, and return -EIO if it never lands.
+ */
+static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
+				       u8 *addr)
+{
+	bool landed;
+	int try, i, err;
+	u8 seq;
+
+	for (try = 1; try <= 3; try++) {
+		err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr,
+					    ETH_ALEN);
+		if (err)
+			return err;
+
+		seq = mt->mcu_last_seq;
+		landed = false;
+		for (i = 0; i < 5 && !landed; i++) {
+			landed = xone_mt76_client_addr_is(mt, wcid, addr);
+			if (!landed)
+				usleep_range(2000, 4000);
+		}
+
+		dev_info(mt->dev,
+			 "xone-fix: wcid %d address write %d (seq %d): answered=%s landed=%s\n",
+			 wcid, try, seq,
+			 atomic_read(&mt->mcu_pending) & BIT(seq) ? "no" : "yes",
+			 landed ? "yes" : "no");
+		xone_mt76_log_mcu_stats(mt, "address write");
+
+		if (landed) {
+			if (try > 1)
+				dev_info(mt->dev,
+					 "%s: wcid %d address landed on write %d\n",
+					 __func__, wcid, try);
+			return 0;
+		}
+	}
+
+	dev_warn(mt->dev, "%s: wcid %d address ignored by the firmware\n",
+		 __func__, wcid);
+
+	return -EIO;
+}
+
 int xone_mt76_associate_client(struct xone_mt76 *mt, u8 wcid, u8 *addr)
 {
 	struct sk_buff *skb;
@@ -1227,7 +1671,7 @@ int xone_mt76_associate_client(struct xone_mt76 *mt, u8 wcid, u8 *addr)
 	skb_put_data(skb, &mgmt, mgmt_len);
 	memset(skb_put(skb, 8), 0, 8);
 
-	err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr, ETH_ALEN);
+	err = xone_mt76_write_client_addr(mt, wcid, addr);
 	if (err)
 		goto err_free_skb;
 

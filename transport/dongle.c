@@ -37,6 +37,11 @@ module_param_named(fw_override, fw_override_pid, ushort, 0600);
 #define XONE_DONGLE_FW_REQ_RETRIES 11 // 30 seconds
 #define XONE_DONGLE_FW_LOAD_RETRIES 3
 
+/* system_wq is deprecated in favor of its explicit per-CPU name */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+#define system_percpu_wq system_wq
+#endif
+
 enum xone_dongle_queue {
 	XONE_DONGLE_QUEUE_DATA = 0x00,
 	XONE_DONGLE_QUEUE_AUDIO = 0x02,
@@ -59,6 +64,10 @@ struct xone_dongle_client {
 	u8 wcid;
 	u8 address[ETH_ALEN];
 	bool encryption_enabled;
+	int assoc_retries;
+	bool connected;
+	/* debug: logged with the client's first data */
+	unsigned long assoc_time;
 
 	struct gip_adapter *adapter;
 };
@@ -109,6 +118,9 @@ struct xone_dongle {
 	enum xone_dongle_fw_state fw_state;
 	u16 vendor;
 	u16 product;
+
+	/* last reset requested by the driver itself (0 = never) */
+	unsigned long self_reset_time;
 };
 
 static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index, bool silent);
@@ -125,6 +137,50 @@ static u8 xone_dongle_find_channel_idx(struct xone_dongle *dongle)
 	}
 
 	return 0;
+}
+
+/*
+ * The pairing channel scan (dlundqvist/xone#168) was added for the 02fe
+ * dongle. On 02e6, which never needed it (xow), controllers connect in 4-5 s
+ * without it instead of 10-15 s.
+ */
+static bool xone_dongle_wants_pairing_scan(struct xone_dongle *dongle)
+{
+	return dongle->product != 0x02e6;
+}
+
+/*
+ * A firmware session that ignores our writes was only ever cured by a USB
+ * reset. It drops every client, so never while one is connected, and at most
+ * once a minute so it can't loop.
+ */
+static bool xone_dongle_self_reset(struct xone_dongle *dongle,
+				   const char *why)
+{
+	unsigned long flags;
+	int i, connected = 0;
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
+		if (dongle->clients[i] && dongle->clients[i]->connected)
+			connected++;
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+
+	if (connected) {
+		dev_warn(dongle->mt.dev, "%s: not resetting, %d client(s) connected\n",
+			 why, connected);
+		return false;
+	}
+
+	if (dongle->self_reset_time &&
+	    time_before(jiffies, dongle->self_reset_time + 60 * HZ))
+		return false;
+
+	dongle->self_reset_time = jiffies | 1;
+	dev_warn(dongle->mt.dev, "%s: resetting the dongle\n", why);
+	usb_queue_reset_device(to_usb_interface(dongle->mt.dev));
+
+	return true;
 }
 
 static void xone_dongle_prep_packet(struct xone_dongle_client *client,
@@ -283,10 +339,11 @@ static int xone_dongle_pairing_handler(struct xone_dongle *dongle, bool enable,
 	if (enable) {
 		dongle->last_wlan_rx = jiffies;
 		dongle->pairing_scan_idx = xone_dongle_find_channel_idx(dongle);
-		mod_delayed_work(system_wq, &dongle->pairing_work,
+		mod_delayed_work(system_percpu_wq, &dongle->pairing_work,
 				 msecs_to_jiffies(timeout_secs * 1000));
-		mod_delayed_work(system_wq, &dongle->pairing_scan_work,
-				 XONE_DONGLE_PAIR_SCAN_INTERVAL);
+		if (xone_dongle_wants_pairing_scan(dongle))
+			mod_delayed_work(system_percpu_wq, &dongle->pairing_scan_work,
+					 XONE_DONGLE_PAIR_SCAN_INTERVAL);
 	} else {
 		cancel_delayed_work(&dongle->pairing_scan_work);
 	}
@@ -375,7 +432,7 @@ static void xone_dongle_pairing_scan(struct work_struct *work)
 	dongle->last_wlan_rx = jiffies;
 
 out_resched:
-	mod_delayed_work(system_wq, &dongle->pairing_scan_work,
+	mod_delayed_work(system_percpu_wq, &dongle->pairing_scan_work,
 			 XONE_DONGLE_PAIR_SCAN_INTERVAL);
 out_unlock:
 	mutex_unlock(&dongle->pairing_lock);
@@ -520,19 +577,49 @@ static int xone_dongle_add_client(struct xone_dongle *dongle, u8 *addr)
 	int i, err;
 	unsigned long flags;
 
-	/* reject duplicate: controller already has a WCID slot */
-	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++)
-		if (dongle->clients[i] &&
-		    ether_addr_equal(dongle->clients[i]->address, addr))
+	/*
+	 * Controller already has a WCID slot: it retransmits its request
+	 * because our association response got lost, so send it again
+	 * instead of allocating a second slot.
+	 */
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		client = dongle->clients[i];
+		if (!client || !ether_addr_equal(client->address, addr))
+			continue;
+
+		dev_info(dongle->mt.dev,
+			 "xone-fix: controller %pM asked to connect again (retry %d, %u ms after its first request)\n",
+			 addr, client->assoc_retries + 1,
+			 jiffies_to_msecs(jiffies - client->assoc_time));
+		if (!client->assoc_retries)
+			xone_mt76_log_client_slots(&dongle->mt);
+
+		/* safety net for anything else that leaves a client stuck */
+		if (++client->assoc_retries == 3 &&
+		    xone_dongle_self_reset(dongle, "client still can't connect"))
 			return 0;
+
+		err = xone_mt76_associate_client(&dongle->mt, i + 1, addr);
+		if (err == -EIO &&
+		    xone_dongle_self_reset(dongle, "firmware ignored the client address"))
+			return 0;
+
+		return err;
+	}
 
 	client = xone_dongle_create_client(dongle, addr);
 	if (IS_ERR(client))
 		return PTR_ERR(client);
 
+	client->assoc_time = jiffies;
+
 	err = xone_mt76_associate_client(&dongle->mt, client->wcid, addr);
-	if (err)
+	if (err) {
+		if (err == -EIO &&
+		    xone_dongle_self_reset(dongle, "firmware ignored the client address"))
+			err = 0;
 		goto err_free_client;
+	}
 
 	if (!dongle->pairing) {
 		err = xone_mt76_set_led_mode(&dongle->mt, XONE_MT_LED_ON);
@@ -711,6 +798,14 @@ static int xone_dongle_handle_qos_data(struct xone_dongle *dongle,
 		 */
 		if (dongle->pairing)
 			dongle->last_wlan_rx = jiffies;
+		if (!client->connected)
+			dev_info(dongle->mt.dev,
+				 "xone-fix: controller %pM answered %u ms after its first request (retries %d, on channel %u)\n",
+				 client->address,
+				 jiffies_to_msecs(jiffies - client->assoc_time),
+				 client->assoc_retries,
+				 dongle->mt.channel ? dongle->mt.channel->index : 0);
+		client->connected = true;
 		err = gip_process_buffer(client->adapter, skb->data, skb->len);
 	}
 
@@ -834,6 +929,46 @@ static int xone_dongle_handle_loss(struct xone_dongle *dongle,
 	return xone_dongle_handle_disassociation(dongle, wcid);
 }
 
+/*
+ * Debug: frames from one of our controllers that the chip did not match to
+ * its WCID (tag 0xff or a free slot), so xone drops them silently. This is how
+ * the missing WCID table address was found. Frames tagged with the
+ * controller's slot (idle QoS-null, probe requests) are normal and not logged.
+ */
+static void xone_dongle_log_dropped(struct xone_dongle *dongle,
+				    struct ieee80211_hdr_3addr *hdr, u16 type,
+				    u8 wcid)
+{
+	u16 kind = type & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE);
+	unsigned long flags;
+	int i;
+
+	switch (kind) {
+	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ASSOC_REQ:
+	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DISASSOC:
+	case IEEE80211_FTYPE_MGMT | XONE_MT_WLAN_RESERVED:
+		return;
+	}
+
+	/* lockless pre-check: the common case (a known slot) costs nothing */
+	if (wcid && wcid <= XONE_DONGLE_MAX_CLIENTS && dongle->clients[wcid - 1])
+		return;
+
+	spin_lock_irqsave(&dongle->clients_lock, flags);
+
+	for (i = 0; i < XONE_DONGLE_MAX_CLIENTS; i++) {
+		if (dongle->clients[i] &&
+		    ether_addr_equal(dongle->clients[i]->address, hdr->addr2)) {
+			dev_info_ratelimited(dongle->mt.dev,
+					     "xone-fix: dropped frame from controller %pM: type 0x%04x, chip slot %u (driver slot %d)\n",
+					     hdr->addr2, kind, wcid, i + 1);
+			break;
+		}
+	}
+
+	spin_unlock_irqrestore(&dongle->clients_lock, flags);
+}
+
 static int xone_dongle_process_frame(struct xone_dongle *dongle,
 				     struct sk_buff *skb,
 				     unsigned int hdr_len, u8 wcid)
@@ -846,8 +981,18 @@ static int xone_dongle_process_frame(struct xone_dongle *dongle,
 	if (skb->len < hdr_len || hdr_len < sizeof(*hdr))
 		return 0;
 
+	/*
+	 * Drop frames with a non-zero protocol version. Misparsed or
+	 * foreign frames otherwise get matched as association requests
+	 * (subtype 0) and flood the client table with bogus addresses.
+	 */
+	if (hdr->frame_control & cpu_to_le16(IEEE80211_FCTL_VERS))
+		return 0;
+
 	skb_pull(skb, hdr_len);
 	type = le16_to_cpu(hdr->frame_control);
+
+	xone_dongle_log_dropped(dongle, hdr, type, wcid);
 
 	switch (type & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE)) {
 	case IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA:
@@ -858,8 +1003,10 @@ static int xone_dongle_process_frame(struct xone_dongle *dongle,
 		 * carrying multicast or all-zero source addresses (addr2).
 		 * A real controller always uses a valid unicast address.
 		 * Accepting invalid addresses exhausts the client table.
+		 * A real request is also always addressed to the dongle.
 		 */
-		if (!is_valid_ether_addr(hdr->addr2))
+		if (!is_valid_ether_addr(hdr->addr2) ||
+		    !ether_addr_equal(hdr->addr1, dongle->mt.address))
 			return 0;
 		return xone_dongle_handle_association(dongle, hdr->addr2);
 	case IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DISASSOC:
@@ -919,6 +1066,19 @@ static int xone_dongle_process_message(struct xone_dongle *dongle,
 
 	info = get_unaligned_le32(skb->data);
 	port = FIELD_GET(MT_RX_FCE_INFO_D_PORT, info);
+
+	/* debug: answers to numbered MCU commands (mainline: EVT_CMD_DONE etc.) */
+	if (port == MT_CPU_RX_PORT && FIELD_GET(MT_RX_FCE_INFO_CMD_SEQ, info) &&
+	    FIELD_GET(MT_RX_FCE_INFO_EVT_TYPE, info) <= 2) {
+		if (dongle->mt.mcu_raw_logged < 8) {
+			dongle->mt.mcu_raw_logged++;
+			dev_info(dongle->mt.dev,
+				 "xone-fix: MCU answer header 0x%08x (len %u)\n",
+				 info, skb->len);
+		}
+		xone_mt76_mcu_answer(&dongle->mt, info);
+		return 0;
+	}
 
 	/* ignore command reponses */
 	if (FIELD_GET(MT_RX_FCE_INFO_CMD_SEQ, info) == 0x01)
@@ -1131,9 +1291,12 @@ static void xone_dongle_fw_load(struct work_struct *work)
 
 
 	for (int i = 0; i < 5; ++i) {
+		mt->fw_attempt = i + 1;
 		err = xone_mt76_load_firmware(mt, fw);
 		if (!err)
 			break;
+		dev_warn(mt->dev, "xone-fix: firmware load attempt %d failed: %d\n",
+			 i + 1, err);
 		ssleep(1);
 	}
 	release_firmware(fw);
@@ -1230,6 +1393,20 @@ static int xone_dongle_power_off_client(struct xone_dongle *dongle, int index,
 
 	spin_unlock_irqrestore(&dongle->clients_lock, flags);
 	return err;
+}
+
+/*
+ * Mainline stops the MAC on cleanup. Left receiving, a chip that keeps USB
+ * power piles up controller traffic until the next firmware load.
+ */
+static void xone_dongle_stop_rx(struct xone_dongle *dongle)
+{
+	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY ||
+	    dongle->mt.udev->state == USB_STATE_NOTATTACHED)
+		return;
+
+	xone_mt76_stop_rx(&dongle->mt);
+	dev_info(dongle->mt.dev, "xone-fix: unload: radio receive stopped\n");
 }
 
 static int xone_dongle_power_off_clients(struct xone_dongle *dongle)
@@ -1362,6 +1539,7 @@ static void xone_dongle_disconnect(struct usb_interface *intf)
 		dev_dbg(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
 
+	xone_dongle_stop_rx(dongle);
 	xone_dongle_destroy(dongle);
 	usb_set_intfdata(intf, NULL);
 }
@@ -1429,13 +1607,17 @@ static void xone_dongle_shutdown(struct usb_interface *intf)
 	if (dongle->fw_state != XONE_DONGLE_FW_STATE_READY)
 		dongle->fw_state = XONE_DONGLE_FW_STATE_STOP_LOADING;
 
-	if (system_state == SYSTEM_RESTART)
+	if (system_state == SYSTEM_RESTART) {
+		xone_dongle_stop_rx(dongle);
 		return;
+	}
 
 	err = xone_dongle_power_off_clients(dongle);
 	if (err)
 		dev_err(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
+
+	xone_dongle_stop_rx(dongle);
 }
 
 static int xone_dongle_pre_reset(struct usb_interface *intf)
@@ -1546,7 +1728,12 @@ static int xone_dongle_reset_resume(struct usb_interface *intf)
 
 static const struct usb_device_id xone_dongle_id_table[] = {
 	{ USB_DEVICE(0x045e, 0x02e6) }, /* old dongle */
-	{ USB_DEVICE(0x045e, 0x02fe) }, /* new dongle */
+	/*
+	 * The new dongle (0x02fe) is handled by the in-kernel mt76x2u driver
+	 * plus the xone_mtnet transport, so it runs on MediaTek's own firmware
+	 * (from linux-firmware) instead of Microsoft's blob. It is deliberately
+	 * not claimed here; mt76x2u is no longer blacklisted for it.
+	 */
 	{ USB_DEVICE(0x045e, 0x02f9) }, /* built-in dongle (ASUS, Lenovo) */
 	{ USB_DEVICE(0x045e, 0x091e) }, /* built-in dongle (Surface Book 2) */
 	{ },

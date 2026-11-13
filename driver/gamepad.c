@@ -8,13 +8,22 @@
 #include <linux/timer.h>
 #include <linux/version.h>
 
+#ifndef from_timer
+#define from_timer timer_container_of
+#endif
+
 #include "common.h"
 #include "../auth/auth.h"
+
+ushort trigger_rumble_mode = 0;
+MODULE_PARM_DESC(trigger_rumble_mode, "Trigger rumble mode. 0: disable, 1: pressure.");
+module_param(trigger_rumble_mode, ushort, 0644);
 
 #define GIP_GP_NAME "Microsoft Xbox Controller"
 
 #define GIP_VENDOR_MICROSOFT 0x045e
 #define GIP_PRODUCT_ELITE_SERIES_2 0x0b00
+#define GIP_PRODUCT_ELITE_SERIES_2_BT 0x0b22
 #define GIP_PRODUCT_ELITE 0x02e3
 
 /*
@@ -26,7 +35,9 @@
 #define GIP_ELITE_SERIES_2_510_FIRMWARE 0x050A
 
 #define GIP_GP_RUMBLE_DELAY msecs_to_jiffies(10)
+#define GIP_GP_RUMBLE_TRIGGER_DELAY msecs_to_jiffies(50)
 #define GIP_GP_RUMBLE_MAX 100
+#define GIP_GP_RUMBLE_TRIGGER_MAX 100
 
 /* button offset from end of packet */
 #define GIP_GP_BTN_SHARE_OFFSET 18
@@ -131,6 +142,11 @@ struct gip_gamepad_rumble {
 	struct timer_list timer;
 	struct gip_gamepad_pkt_rumble pkt;
 
+	u8 main_left;
+	u8 main_right;
+	u16 trig_pos_left;
+	u16 trig_pos_right;
+
 	struct gip_gamepad *parent;
 };
 
@@ -163,6 +179,29 @@ static void gip_gamepad_send_rumble(struct timer_list *timer)
 
 	spin_lock_irqsave(&rumble->lock, flags);
 
+	u8 left_main = rumble->main_left;
+	u8 right_main = rumble->main_right;
+
+	u16 trig_l = rumble->trig_pos_left;
+	u16 trig_r = rumble->trig_pos_right;
+
+	u8 pct_l = (trig_l * GIP_GP_RUMBLE_TRIGGER_MAX + 511) / 1023;
+	u8 pct_r = (trig_r * GIP_GP_RUMBLE_TRIGGER_MAX + 511) / 1023;
+
+	/*
+	 * we want to keep the rumbling at the triggers at the maximum
+	 * of the weak and strong main rumble
+	 */
+	u8 max_main = max(left_main, right_main);
+
+	u8 left_trigger = (max_main * pct_l + 50) / 100;
+	u8 right_trigger = (max_main * pct_r + 50) / 100;
+
+	rumble->pkt.left = left_main;
+	rumble->pkt.right = right_main;
+	rumble->pkt.left_trigger = trigger_rumble_mode == 1 ? left_trigger : 0;
+	rumble->pkt.right_trigger = trigger_rumble_mode == 1 ? right_trigger : 0;
+
 	gip_send_rumble(gamepad->client, &rumble->pkt, sizeof(rumble->pkt));
 	rumble->last = jiffies;
 
@@ -182,8 +221,8 @@ static int gip_gamepad_queue_rumble(struct input_dev *dev, void *data,
 
 	spin_lock_irqsave(&rumble->lock, flags);
 
-	rumble->pkt.left = mag_left * GIP_GP_RUMBLE_MAX / U16_MAX;
-	rumble->pkt.right = mag_right * GIP_GP_RUMBLE_MAX / U16_MAX;
+	rumble->main_left = mag_left * GIP_GP_RUMBLE_MAX / U16_MAX;
+	rumble->main_right = mag_right * GIP_GP_RUMBLE_MAX / U16_MAX;
 
 	/* delay rumble to work around firmware bug */
 	if (!timer_pending(&rumble->timer))
@@ -379,13 +418,26 @@ static int gip_gamepad_op_firmware(struct gip_client *client, void *data,
 static int gip_gamepad_op_input(struct gip_client *client, void *data, u32 len)
 {
 	struct gip_gamepad *gamepad = dev_get_drvdata(&client->dev);
+	struct gip_gamepad_rumble *rumble = &gamepad->rumble;
 	struct gip_gamepad_pkt_input *pkt = data;
 	struct input_dev *dev = gamepad->input.dev;
 	u16 buttons;
 	u8 share_offset = GIP_GP_BTN_SHARE_OFFSET;
+    unsigned long flags;
 
 	if (len < sizeof(*pkt))
 		return -EINVAL;
+
+	spin_lock_irqsave(&rumble->lock, flags);
+
+	rumble->trig_pos_left = le16_to_cpu(pkt->trigger_left);
+	rumble->trig_pos_right = le16_to_cpu(pkt->trigger_right);
+
+	/* delay rumble to work around firmware bug */
+	if (!timer_pending(&rumble->timer) && trigger_rumble_mode == 1)
+		mod_timer(&rumble->timer, rumble->last + GIP_GP_RUMBLE_TRIGGER_DELAY);
+
+	spin_unlock_irqrestore(&rumble->lock, flags);
 
 	buttons = le16_to_cpu(pkt->buttons);
 
@@ -519,6 +571,16 @@ static int gip_gamepad_probe(struct gip_client *client)
 	err = gip_init_input(&gamepad->input, client, GIP_GP_NAME);
 	if (err)
 		return err;
+
+	/*
+	 * Steam only recognizes the Elite Series 2 (and its paddles) under
+	 * the product ID the controller uses over Bluetooth.
+	 * There is an open issue: https://github.com/ValveSoftware/steam-for-linux/issues/8463
+	 * Revert and re-test once upstream is fixed.
+	 */
+	if (client->hardware.vendor == GIP_VENDOR_MICROSOFT &&
+	    client->hardware.product == GIP_PRODUCT_ELITE_SERIES_2)
+		gamepad->input.dev->id.product = GIP_PRODUCT_ELITE_SERIES_2_BT;
 
 	err = gip_gamepad_init_input(gamepad);
 	if (err)
