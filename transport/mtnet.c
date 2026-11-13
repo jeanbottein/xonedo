@@ -36,7 +36,11 @@
 #include <linux/if_ether.h>
 #include <linux/if_arp.h>
 #include <linux/usb.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
 #include <linux/ktime.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
