@@ -63,6 +63,9 @@ struct xone_mt76 {
 
 	/* debug: firmware load attempt number, for the xone-fix log line */
 	int fw_attempt;
+
+	/* the last firmware load found the chip running (warm start) */
+	bool warm_start;
 };
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);

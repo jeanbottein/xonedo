@@ -715,7 +715,9 @@ static int __xone_mt76_load_firmware(struct xone_mt76 *mt,
 	u32 val;
 	int err;
 
-	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
+	mt->warm_start = xone_mt76_read_register(mt, MT_FCE_DMA_ADDR |
+						 MT_VEND_TYPE_CFG);
+	if (mt->warm_start) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
 		*warm = true;
 		*rx_pages = xone_mt76_read_register(mt, 0x0a30);
@@ -1269,9 +1271,15 @@ void xone_mt76_stop_rx(struct xone_mt76 *mt)
 
 int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
-	int err, stale_keys, stale_addrs;
+	int err, stale_keys = 0, stale_addrs = 0;
 
-	stale_keys = xone_mt76_count_client_slots(mt, &stale_addrs);
+	/*
+	 * Old clients can only be left on a warm chip. A cold chip's table
+	 * holds power-up junk the firmware ignores, and reading or clearing
+	 * it there makes the chip stop answering control transfers.
+	 */
+	if (mt->warm_start)
+		stale_keys = xone_mt76_count_client_slots(mt, &stale_addrs);
 
 	dev_dbg(mt->dev, "%s: id=0x%04x\n", __func__,
 		xone_mt76_get_chip_id(mt));
