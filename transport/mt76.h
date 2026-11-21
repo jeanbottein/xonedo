@@ -60,6 +60,9 @@ struct xone_mt76 {
 
 	struct xone_mt76_channel channels[XONE_MT_NUM_CHANNELS];
 	struct xone_mt76_channel *channel;
+
+	/* the last firmware load found the chip running (warm start) */
+	bool warm_start;
 };
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
