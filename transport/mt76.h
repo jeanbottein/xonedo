@@ -71,6 +71,9 @@ struct xone_mt76 {
 	u8 mcu_seq;
 	u8 mcu_wait_seq;
 	u8 mcu_evt;
+
+	/* the last firmware load found the chip running (warm start) */
+	bool warm_start;
 };
 
 /* MCU answer event types (mainline enum mcu_evt_type) */
