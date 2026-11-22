@@ -72,9 +72,6 @@ struct xone_mt76 {
 	u8 mcu_last_seq;
 	unsigned int mcu_sent, mcu_answered, mcu_errors, mcu_lost, mcu_overlaps;
 	unsigned int mcu_raw_logged;
-
-	/* the last firmware load found the chip running (warm start) */
-	bool warm_start;
 };
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
