@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <linux/completion.h>
+#include <linux/mutex.h>
+
 #include "mt76_defs.h"
 
 #define XONE_MT_EP_IN_CMD 0x05
@@ -72,7 +75,22 @@ struct xone_mt76 {
 	u8 mcu_last_seq;
 	unsigned int mcu_sent, mcu_answered, mcu_errors, mcu_lost, mcu_overlaps;
 	unsigned int mcu_raw_logged;
+
+	/* confirmed MCU commands: one at a time, wait for the answer, resend */
+	struct mutex mcu_lock;
+	struct completion mcu_done;
+	bool mcu_answers;	/* the command endpoint is being read */
+	u8 mcu_wait_seq;
+	u8 mcu_evt;
+	unsigned int mcu_resent, mcu_failed;
 };
+
+/* MCU answer event types (mainline enum mcu_evt_type) */
+#define XONE_MT_EVT_CMD_DONE 0
+#define XONE_MT_EVT_CMD_ERROR 1
+#define XONE_MT_EVT_CMD_RETRY 2
+
+void xone_mt76_init_mcu(struct xone_mt76 *mt);
 
 struct sk_buff *xone_mt76_alloc_message(int len, gfp_t gfp);
 void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd);

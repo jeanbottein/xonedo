@@ -1337,6 +1337,9 @@ static void xone_dongle_fw_load(struct work_struct *work)
 		return;
 	}
 
+	/* the command endpoint is read now: MCU commands can be confirmed */
+	WRITE_ONCE(mt->mcu_answers, true);
+
 	for (int i = 0; i < 3; i++) {
 		err = xone_mt76_init_radio(mt);
 		if (err != -ETIMEDOUT)
@@ -1454,6 +1457,7 @@ static void xone_dongle_destroy(struct xone_dongle *dongle)
 		dongle->fw_state = XONE_DONGLE_FW_STATE_STOP_LOADING;
 	}
 
+	WRITE_ONCE(dongle->mt.mcu_answers, false);
 	usb_kill_anchored_urbs(&dongle->urbs_in_busy);
 	/* cancel fw load before destroying workqueues to avoid use-after-free */
 	cancel_work_sync(&dongle->load_fw_work);
@@ -1497,6 +1501,7 @@ static int xone_dongle_probe(struct usb_interface *intf,
 
 	dongle->mt.dev = &intf->dev;
 	dongle->mt.udev = interface_to_usbdev(intf);
+	xone_mt76_init_mcu(&dongle->mt);
 
 	dongle->vendor = id->idVendor;
 	dongle->product = id->idProduct;
@@ -1576,6 +1581,7 @@ static int xone_dongle_suspend(struct usb_interface *intf, pm_message_t message)
 		dev_err(dongle->mt.dev, "%s: power off failed: %d\n",
 			__func__, err);
 
+	WRITE_ONCE(dongle->mt.mcu_answers, false);
 	usb_kill_anchored_urbs(&dongle->urbs_in_busy);
 	usb_kill_anchored_urbs(&dongle->urbs_out_busy);
 	cancel_delayed_work_sync(&dongle->pairing_work);
@@ -1611,6 +1617,7 @@ static int xone_dongle_resume(struct usb_interface *intf)
 			return err;
 	}
 
+	WRITE_ONCE(dongle->mt.mcu_answers, true);
 	msleep(1000);
 	return xone_mt76_resume_radio(&dongle->mt);
 }
@@ -1658,6 +1665,7 @@ static int xone_dongle_pre_reset(struct usb_interface *intf)
 
 	cancel_delayed_work_sync(&dongle->pairing_work);
 	cancel_delayed_work_sync(&dongle->pairing_scan_work);
+	WRITE_ONCE(dongle->mt.mcu_answers, false);
 	usb_kill_anchored_urbs(&dongle->urbs_in_busy);
 	usb_kill_anchored_urbs(&dongle->urbs_out_busy);
 
@@ -1709,6 +1717,7 @@ static int xone_dongle_reset_resume(struct usb_interface *intf)
 	if (dongle->fw_state < XONE_DONGLE_FW_STATE_ERROR)
 		dongle->fw_state = XONE_DONGLE_FW_STATE_STOP_LOADING;
 
+	WRITE_ONCE(dongle->mt.mcu_answers, false);
 	usb_kill_anchored_urbs(&dongle->urbs_in_busy);
 	cancel_work_sync(&dongle->load_fw_work);
 	/*

@@ -212,33 +212,47 @@ void xone_mt76_prep_command(struct sk_buff *skb, enum mt76_mcu_cmd cmd)
 			       FIELD_PREP(MT_MCU_MSG_CMD_TYPE, cmd));
 }
 
+#define XONE_MT_MCU_TIMEOUT msecs_to_jiffies(300)
+#define XONE_MT_MCU_TRIES 3
+
+void xone_mt76_init_mcu(struct xone_mt76 *mt)
+{
+	mutex_init(&mt->mcu_lock);
+	init_completion(&mt->mcu_done);
+}
+
 /*
- * Debug experiment: number every MCU command (seq 1..15, like mainline
+ * Number every MCU command (seq 1..15, like mainline
  * __mt76x02u_mcu_send_msg()) so the firmware answers it, and track the
  * answers (xone_mt76_mcu_answer()). Command type 0 (firmware upload chunks,
  * client packets) keeps seq 0.
  */
-static int xone_mt76_send_command(struct xone_mt76 *mt, struct sk_buff *skb,
-				  enum mt76_mcu_cmd cmd)
+static u8 xone_mt76_next_seq(struct xone_mt76 *mt, enum mt76_mcu_cmd cmd)
 {
-	int err, seq = 0;
+	u8 seq;
 
-	if (cmd) {
-		do {
-			seq = atomic_inc_return(&mt->mcu_seq) & 0xf;
-		} while (!seq);
+	do {
+		seq = atomic_inc_return(&mt->mcu_seq) & 0xf;
+	} while (!seq);
 
-		if (atomic_fetch_or(BIT(seq), &mt->mcu_pending) & BIT(seq)) {
-			mt->mcu_lost++;
-			dev_info_ratelimited(mt->dev,
-					     "xone-fix: MCU command %u (seq %d) never answered\n",
-					     mt->mcu_cmd[seq], seq);
-		}
-
-		mt->mcu_cmd[seq] = cmd;
-		mt->mcu_last_seq = seq;
-		mt->mcu_sent++;
+	if (atomic_fetch_or(BIT(seq), &mt->mcu_pending) & BIT(seq)) {
+		mt->mcu_lost++;
+		dev_info_ratelimited(mt->dev,
+				     "xone-fix: MCU command %u (seq %d) never answered\n",
+				     mt->mcu_cmd[seq], seq);
 	}
+
+	mt->mcu_cmd[seq] = cmd;
+	mt->mcu_last_seq = seq;
+	mt->mcu_sent++;
+
+	return seq;
+}
+
+static int xone_mt76_send_msg(struct xone_mt76 *mt, struct sk_buff *skb,
+			      enum mt76_mcu_cmd cmd, u8 seq)
+{
+	int err;
 
 	if (atomic_inc_return(&mt->mcu_inflight) > 1) {
 		mt->mcu_overlaps++;
@@ -260,7 +274,87 @@ static int xone_mt76_send_command(struct xone_mt76 *mt, struct sk_buff *skb,
 	return err;
 }
 
-/* debug: an answer from the firmware to a numbered command */
+/*
+ * Mainline mt76x02u sends MCU commands one at a time and waits for the
+ * firmware's answer (EVT_CMD_DONE), resending on EVT_CMD_RETRY or no answer.
+ * xone and xow never waited. Microsoft's firmware answers the same way.
+ * Experiment (2026-11): does waiting and resending remove the sessions where
+ * the client address write is ignored? The address read-back and the
+ * self-reset stay as a safety net; the log says which one acted.
+ */
+static int xone_mt76_send_confirmed(struct xone_mt76 *mt, struct sk_buff *skb,
+				    enum mt76_mcu_cmd cmd)
+{
+	struct sk_buff *msg;
+	int try, err = 0;
+	u8 seq;
+
+	for (try = 1; try <= XONE_MT_MCU_TRIES; try++) {
+		msg = skb_copy(skb, GFP_KERNEL);
+		if (!msg)
+			return -ENOMEM;
+
+		seq = xone_mt76_next_seq(mt, cmd);
+		reinit_completion(&mt->mcu_done);
+		WRITE_ONCE(mt->mcu_wait_seq, seq);
+
+		err = xone_mt76_send_msg(mt, msg, cmd, seq);
+		if (err)
+			break;
+
+		if (!wait_for_completion_timeout(&mt->mcu_done,
+						 XONE_MT_MCU_TIMEOUT))
+			err = -ETIMEDOUT;
+		else if (mt->mcu_evt == XONE_MT_EVT_CMD_DONE)
+			break;
+		else
+			err = -EIO;
+
+		if (err == -EIO && mt->mcu_evt != XONE_MT_EVT_CMD_RETRY)
+			break;
+
+		if (try < XONE_MT_MCU_TRIES)
+			mt->mcu_resent++;
+		dev_info(mt->dev,
+			 "xone-fix: MCU command %u (seq %d) %s, try %d/%d\n",
+			 cmd, seq,
+			 err == -ETIMEDOUT ? "not answered" : "to retry",
+			 try, XONE_MT_MCU_TRIES);
+	}
+
+	WRITE_ONCE(mt->mcu_wait_seq, 0);
+
+	if (err) {
+		mt->mcu_failed++;
+		dev_warn(mt->dev, "xone-fix: MCU command %u failed: %d (event %u)\n",
+			 cmd, err, mt->mcu_evt);
+	}
+
+	return err;
+}
+
+static int xone_mt76_send_command(struct xone_mt76 *mt, struct sk_buff *skb,
+				  enum mt76_mcu_cmd cmd)
+{
+	int err;
+
+	/* type 0 (upload chunks, client packets) is never answered */
+	if (!cmd)
+		return xone_mt76_send_msg(mt, skb, cmd, 0);
+
+	if (!READ_ONCE(mt->mcu_answers))
+		return xone_mt76_send_msg(mt, skb, cmd,
+					  xone_mt76_next_seq(mt, cmd));
+
+	mutex_lock(&mt->mcu_lock);
+	err = xone_mt76_send_confirmed(mt, skb, cmd);
+	mutex_unlock(&mt->mcu_lock);
+	consume_skb(skb);
+
+	return err;
+}
+
+/* an answer from the firmware to a numbered command */
 void xone_mt76_mcu_answer(struct xone_mt76 *mt, u32 info)
 {
 	u8 seq = FIELD_GET(MT_RX_FCE_INFO_CMD_SEQ, info);
@@ -268,6 +362,11 @@ void xone_mt76_mcu_answer(struct xone_mt76 *mt, u32 info)
 
 	atomic_andnot(BIT(seq), &mt->mcu_pending);
 	mt->mcu_answered++;
+
+	if (seq == READ_ONCE(mt->mcu_wait_seq)) {
+		mt->mcu_evt = evt;
+		complete(&mt->mcu_done);
+	}
 
 	if (evt) {
 		mt->mcu_errors++;
@@ -280,9 +379,10 @@ void xone_mt76_mcu_answer(struct xone_mt76 *mt, u32 info)
 static void xone_mt76_log_mcu_stats(struct xone_mt76 *mt, const char *when)
 {
 	dev_info(mt->dev,
-		 "xone-fix: MCU stats (%s): sent %u, answered %u, error/retry %u, never answered %u, overlaps %u\n",
+		 "xone-fix: MCU stats (%s): sent %u, answered %u, error/retry %u, never answered %u, overlaps %u, resent %u, failed %u\n",
 		 when, mt->mcu_sent, mt->mcu_answered, mt->mcu_errors,
-		 mt->mcu_lost, mt->mcu_overlaps);
+		 mt->mcu_lost, mt->mcu_overlaps, mt->mcu_resent,
+		 mt->mcu_failed);
 }
 
 static int xone_mt76_send_wlan(struct xone_mt76 *mt, struct sk_buff *skb)
@@ -1566,9 +1666,10 @@ static int xone_mt76_write_client_addr(struct xone_mt76 *mt, u8 wcid,
 	u8 seq;
 
 	for (try = 1; try <= 3; try++) {
+		/* a confirmed write that failed may still have landed: check */
 		err = xone_mt76_write_burst(mt, MT_WCID_ADDR(wcid), addr,
 					    ETH_ALEN);
-		if (err)
+		if (err && err != -ETIMEDOUT && err != -EIO)
 			return err;
 
 		seq = mt->mcu_last_seq;
