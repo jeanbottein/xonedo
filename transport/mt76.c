@@ -291,8 +291,10 @@ static int xone_mt76_send_confirmed(struct xone_mt76 *mt, struct sk_buff *skb,
 
 	for (try = 1; try <= XONE_MT_MCU_TRIES; try++) {
 		msg = skb_copy(skb, GFP_KERNEL);
-		if (!msg)
-			return -ENOMEM;
+		if (!msg) {
+			err = -ENOMEM;
+			break;
+		}
 
 		seq = xone_mt76_next_seq(mt, cmd);
 		reinit_completion(&mt->mcu_done);
