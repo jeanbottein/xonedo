@@ -1,0 +1,11 @@
+fuzz_gip
+fuzz_headset_capture
+gen_*.c
+corpus/
+logs/
+v/
+crash-*
+leak-*
+oom-*
+timeout-*
+fuzz-*.log
