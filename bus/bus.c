@@ -38,17 +38,62 @@ static int gip_client_uevent(const struct device *dev,
 	return add_uevent_var(env, "MODALIAS=gip:%s", classes->strings[0]);
 }
 
-static void gip_client_release(struct device *dev)
+static void gip_free_client(struct gip_client *client)
 {
-	struct gip_client *client = to_gip_client(dev);
-
 	gip_free_client_info(client);
 	kfree(client->chunk_buf_out);
 	kfree(client->chunk_buf_in);
 	kfree(client);
 }
 
+static void gip_client_release(struct device *dev)
+{
+	gip_free_client(to_gip_client(dev));
+}
+
+/*
+ * A client that never got through identification has no registered device,
+ * so nothing would ever free it. dev.type is only set once device_register()
+ * was tried; after a failed register, put_device() frees it via release.
+ */
+static void gip_discard_client(struct gip_client *client)
+{
+	if (client->dev.type)
+		put_device(&client->dev);
+	else
+		gip_free_client(client);
+}
+
+static ssize_t firmware_version_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	u16 *ver = to_gip_client(dev)->hardware.fw_version;
+
+	return sysfs_emit(buf, "%u.%u.%u.%u\n",
+			  ver[0], ver[1], ver[2], ver[3]);
+}
+
+static ssize_t hardware_version_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	u16 *ver = to_gip_client(dev)->hardware.hw_version;
+
+	return sysfs_emit(buf, "%u.%u.%u.%u\n",
+			  ver[0], ver[1], ver[2], ver[3]);
+}
+
+static DEVICE_ATTR_RO(firmware_version);
+static DEVICE_ATTR_RO(hardware_version);
+
+static struct attribute *gip_client_attrs[] = {
+	&dev_attr_firmware_version.attr,
+	&dev_attr_hardware_version.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(gip_client);
+
 static struct device_type gip_client_type = {
+	.groups = gip_client_groups,
 	.uevent = gip_client_uevent,
 	.release = gip_client_release,
 };
@@ -82,6 +127,11 @@ static int gip_bus_probe(struct device *dev)
 	struct gip_driver *drv = to_gip_driver(dev->driver);
 	int err = 0;
 
+	/*
+	 * Packets for this client get -EBUSY while probe holds drv_lock and are
+	 * dropped. Fine in practice: controllers wait for the host after
+	 * identification (none seen in a week of logs, 2026-11).
+	 */
 	if (down_interruptible(&client->drv_lock))
 		return -EINTR;
 
@@ -194,10 +244,13 @@ void gip_destroy_adapter(struct gip_adapter *adap)
 
 	for (i = GIP_MAX_CLIENTS - 1; i >= 0; i--) {
 		client = adap->clients[i];
-		if (!client || !device_is_registered(&client->dev))
+		if (!client)
 			continue;
 
-		device_unregister(&client->dev);
+		if (device_is_registered(&client->dev))
+			device_unregister(&client->dev);
+		else
+			gip_discard_client(client);
 	}
 
 	ida_free(&gip_adapter_ida, adap->id);
@@ -223,15 +276,20 @@ static void gip_register_client(struct work_struct *work)
 	 *
 	 * The unfortunate workaround, that at least works reliably is to add a
 	 * delay here. Since this is for human input device, one second is fine.
+	 * Only applied to id=0 in order to skip sleep delay for non-primary clients (chatpad fix)
 	 */
-	msleep(700);
+	 if (client->id == 0) msleep(700);
 
 	client->dev.parent = &client->adapter->dev;
 	client->dev.type = &gip_client_type;
 	client->dev.bus = &gip_bus_type;
-	sema_init(&client->drv_lock, 1);
 	dev_set_name(&client->dev, "gip%d.%u", client->adapter->id, client->id);
 
+	/*
+	 * On failure the client stays in adapter->clients[] (removing it here
+	 * would race the RX path); gip_discard_client() frees it when the
+	 * client disconnects or the adapter goes away.
+	 */
 	err = device_register(&client->dev);
 	if (err)
 		dev_err(&client->dev, "%s: register failed: %d\n",
@@ -245,8 +303,10 @@ static void gip_unregister_client(struct work_struct *work)
 	struct gip_client *client = container_of(work, typeof(*client),
 						 work_unregister);
 
-	if (!device_is_registered(&client->dev))
+	if (!device_is_registered(&client->dev)) {
+		gip_discard_client(client);
 		return;
+	}
 
 	dev_dbg(&client->dev, "%s: unregistered\n", __func__);
 	device_unregister(&client->dev);
@@ -267,6 +327,7 @@ struct gip_client *gip_get_client(struct gip_adapter *adap, u8 id)
 	client->id = id;
 	client->adapter = adap;
 	sema_init(&client->drv_lock, 1);
+	spin_lock_init(&client->chunk_in_lock);
 	INIT_WORK(&client->work_register, gip_register_client);
 	INIT_WORK(&client->work_unregister, gip_unregister_client);
 
@@ -308,6 +369,7 @@ void gip_free_client_info(struct gip_client *client)
 	kfree(client->hid_descriptor);
 
 	client->client_commands = NULL;
+	client->firmware_versions = NULL;
 	client->audio_formats = NULL;
 	client->capabilities_out = NULL;
 	client->capabilities_in = NULL;

@@ -1,0 +1,5 @@
+# Runs the new Xbox wireless dongle (045e:02fe) on mt76x2u and xone_mtnet instead
+# of as a Wi-Fi adapter. mt76x2u is blacklisted (it would also take the old
+# dongle, 045e:02e6, which needs xone_dongle), so load it here for this one only.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02fe", RUN+="/sbin/modprobe mt76x2u"
+ACTION=="add", SUBSYSTEM=="net", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02fe", ENV{NM_UNMANAGED}="1", RUN+="/usr/libexec/xone-mtnet-setup $attr{ifindex}"

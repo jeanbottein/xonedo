@@ -71,6 +71,8 @@ struct gip_client {
 	struct work_struct work_unregister;
 
 	struct gip_chunk_buffer *chunk_buf_out;
+	/* chunk_buf_in is set by senders and used by the RX path */
+	spinlock_t chunk_in_lock;
 	struct gip_chunk_buffer *chunk_buf_in;
 	struct gip_hardware hardware;
 
@@ -97,7 +99,8 @@ struct gip_driver_ops {
 	int (*authenticated)(struct gip_client *client);
 	int (*guide_button)(struct gip_client *client, bool down);
 	int (*audio_ready)(struct gip_client *client);
-	int (*audio_volume)(struct gip_client *client, u8 in, u8 out);
+	int (*audio_volume)(struct gip_client *client, u8 in, u8 out,
+			    bool mic_muted);
 	int (*hid_report)(struct gip_client *client, void *data, u32 len);
 	int (*input)(struct gip_client *client, void *data, u32 len);
 	int (*firmware)(struct gip_client *client, void *data, u32 len);
