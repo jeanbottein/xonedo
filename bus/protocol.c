@@ -372,6 +372,11 @@ static int gip_send_pkt_simple(struct gip_client *client,
 		goto err_unlock;
 	}
 
+	/*
+	 * The buffer isn't returned to the adapter on -ENOSPC (there is no
+	 * release op), but this can't happen: data packets are at most
+	 * GIP_PKT_MAX_LENGTH, far below the adapters' buffer sizes.
+	 */
 	hdr_len = gip_get_header_length(hdr);
 	if (buf.length < hdr_len + hdr->packet_length) {
 		err = -ENOSPC;

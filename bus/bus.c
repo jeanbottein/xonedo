@@ -127,6 +127,11 @@ static int gip_bus_probe(struct device *dev)
 	struct gip_driver *drv = to_gip_driver(dev->driver);
 	int err = 0;
 
+	/*
+	 * Packets for this client get -EBUSY while probe holds drv_lock and are
+	 * dropped. Fine in practice: controllers wait for the host after
+	 * identification (none seen in a week of logs, 2026-11).
+	 */
 	if (down_interruptible(&client->drv_lock))
 		return -EINTR;
 
@@ -280,6 +285,11 @@ static void gip_register_client(struct work_struct *work)
 	client->dev.bus = &gip_bus_type;
 	dev_set_name(&client->dev, "gip%d.%u", client->adapter->id, client->id);
 
+	/*
+	 * On failure the client stays in adapter->clients[] (removing it here
+	 * would race the RX path); gip_discard_client() frees it when the
+	 * client disconnects or the adapter goes away.
+	 */
 	err = device_register(&client->dev);
 	if (err)
 		dev_err(&client->dev, "%s: register failed: %d\n",

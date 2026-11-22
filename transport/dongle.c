@@ -1119,6 +1119,12 @@ static int xone_dongle_process_buffer(struct xone_dongle *dongle,
 	if (!len)
 		return 0;
 
+	/*
+	 * Frames are processed right here in the URB completion, GIP included,
+	 * on purpose: it is the lowest-latency path for input. The heavy work
+	 * (identify, auth crypto) happens once per connection. The copy into
+	 * an skb is cheap (~100 bytes per input packet) and not worth avoiding.
+	 */
 	skb = dev_alloc_skb(len);
 	if (!skb)
 		return -ENOMEM;
@@ -1589,6 +1595,11 @@ static int xone_dongle_resume(struct usb_interface *intf)
 		return 0;
 	}
 
+	/*
+	 * Blind waits, kept as they are: nothing here tells us when the chip
+	 * is ready. Shorten them only with confirmed MCU commands (wait for
+	 * the firmware's answer) and a series of real suspend/resume tests.
+	 */
 	msleep(1500);
 
 	while ((urb = usb_get_from_anchor(&dongle->urbs_in_idle))) {

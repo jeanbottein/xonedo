@@ -1279,6 +1279,14 @@ void xone_mt76_stop_rx(struct xone_mt76 *mt)
 	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
 }
 
+/*
+ * Don't read or clear the WCID table here, even though mainline resets it at
+ * every init. A freshly powered chip holds junk keys in it (all 16 slots),
+ * the junk survives warm reloads, and clearing it makes the firmware stop
+ * answering: USB -121 on every control transfer until a replug. Tried in
+ * 2026-11 (cold and warm-only variants), both failed; it never fixed a
+ * measured problem.
+ */
 int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
 	int err;
