@@ -7,6 +7,37 @@
     <a href="https://discord.gg/T3dSC3ReuS"><img src="https://img.shields.io/discord/733964971842732042?label=discord&logo=discord" alt="Discord Badge"></a>
 </p>
 
+> [!IMPORTANT]
+> **This is a fork** with fixes for the old Xbox Wireless Adapter (`045e:02e6`) when it dies after a reboot, resume
+> or driver reload, or when a controller pairs but never finishes connecting.
+> Overview, root causes and measurements: **[issue #8](https://github.com/jeanbottein/xonedo/issues/8)**.
+> This default branch is upstream `master` plus this note; the fixes live on the branches below.
+
+### Which branch should I use?
+
+| I want… | Branch | Status |
+|---|---|---|
+| the tested fixes (recommended) | [`warm-start-fixes`](https://github.com/jeanbottein/xonedo/tree/warm-start-fixes) ([#4](https://github.com/jeanbottein/xonedo/pull/4)) | 25/25 warm reloads, real reboots and cold starts, daily use |
+| the same fixes with confirmed firmware commands | [`warm-start-mcu-confirm`](https://github.com/jeanbottein/xonedo/tree/warm-start-mcu-confirm) ([#6](https://github.com/jeanbottein/xonedo/pull/6)) | alternative to #4, shorter run of tests |
+| logs for a bug report | [`warm-start-debug`](https://github.com/jeanbottein/xonedo/tree/warm-start-debug) ([#5](https://github.com/jeanbottein/xonedo/pull/5)) | #4 plus `xone-fix:` log lines |
+| everything, including open dlundqvist/xone PRs | [`supermcuack`](https://github.com/jeanbottein/xonedo/tree/supermcuack) ([#7](https://github.com/jeanbottein/xonedo/pull/7)) | experimental: most cherry-picks are compile-tested only; read #7 first (old-dongle users: `mt76x2u` may claim `02e6`) |
+
+Install a branch with the normal guide below, cloning that branch:
+
+```
+git clone -b warm-start-fixes https://github.com/jeanbottein/xonedo
+cd xonedo
+sudo make install
+```
+
+For logs, use `sudo make install-debug` or the `warm-start-debug` branch, then `journalctl -k | grep xone`.
+
+Only `02e6` has been tested. Reports from other dongles (`02fe`, `02f9`, `091e`) are very welcome on issue #8.
+The full exploration history (every experiment, dead ends included) is the tag
+[`exploration-2026-11-02`](https://github.com/jeanbottein/xonedo/tree/exploration-2026-11-02).
+
+---
+
 `xonedo` is a Linux kernel driver for Xbox One and Xbox Series X|S accessories using the Xbox Wireless Dongle.
 
 > [!NOTE]
