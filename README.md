@@ -17,15 +17,15 @@
 
 | I want… | Branch | Status |
 |---|---|---|
-| the tested fixes (recommended) | [`warm-start-fixes`](https://github.com/jeanbottein/xonedo/tree/warm-start-fixes) ([#4](https://github.com/jeanbottein/xonedo/pull/4)) | 25/25 warm reloads, real reboots and cold starts, daily use |
-| the same fixes with confirmed firmware commands | [`warm-start-mcu-confirm`](https://github.com/jeanbottein/xonedo/tree/warm-start-mcu-confirm) ([#6](https://github.com/jeanbottein/xonedo/pull/6)) | alternative to #4, shorter run of tests |
-| logs for a bug report | [`warm-start-debug`](https://github.com/jeanbottein/xonedo/tree/warm-start-debug) ([#5](https://github.com/jeanbottein/xonedo/pull/5)) | #4 plus `xone-fix:` log lines |
-| everything, including open dlundqvist/xone PRs | [`supermcuack`](https://github.com/jeanbottein/xonedo/tree/supermcuack) ([#7](https://github.com/jeanbottein/xonedo/pull/7)) | experimental: most cherry-picks are compile-tested only; read #7 first (old-dongle users: `mt76x2u` may claim `02e6`) |
+| everything we have: warm-start fixes, 14 driver-wide fix commits (review, fuzzing, KASAN/lockdep), confirmed firmware commands, open dlundqvist/xone PRs | [`supermcuack`](https://github.com/jeanbottein/xonedo/tree/supermcuack) ([#7](https://github.com/jeanbottein/xonedo/pull/7)) | **main line of this fork**: earlier builds daily-driven on `02e6`, the latest commits are being tested; what was checked how: [`docs/supermcuack.md`](https://github.com/jeanbottein/xonedo/blob/supermcuack/docs/supermcuack.md); the cherry-picked community PRs are mostly compile-tested only |
+| only the warm-start and pairing fixes, minimal, for upstream | [`warm-start-fixes`](https://github.com/jeanbottein/xonedo/tree/warm-start-fixes) ([#4](https://github.com/jeanbottein/xonedo/pull/4)) | 25/25 warm reloads, real reboots and cold starts; none of the later fixes |
+| the same with confirmed firmware commands | [`warm-start-mcu-confirm`](https://github.com/jeanbottein/xonedo/tree/warm-start-mcu-confirm) ([#6](https://github.com/jeanbottein/xonedo/pull/6)) | alternative to #4 |
+| logs for a bug report | [`warm-start-debug`](https://github.com/jeanbottein/xonedo/tree/warm-start-debug) ([#5](https://github.com/jeanbottein/xonedo/pull/5)), or `make install-debug` on `supermcuack` | `journalctl -k \| grep xone-fix` |
 
 Install a branch with the normal guide below, cloning that branch:
 
 ```
-git clone -b warm-start-fixes https://github.com/jeanbottein/xonedo
+git clone -b supermcuack https://github.com/jeanbottein/xonedo
 cd xonedo
 sudo make install
 ```
