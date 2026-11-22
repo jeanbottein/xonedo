@@ -16,7 +16,7 @@ Other dongles are untested: reports are welcome on issue #8.
 | Controllers stuck pairing | no pairing scan on `02e6`; client-address read-back + self-reset | ~1 session in 10 had the firmware ignore the address write; caught and recovered every time since |
 | Firmware commands | numbered, one at a time, wait for the answer, resend (as mainline `mt76x02u`) | 2,550+ commands answered in test runs; daily use counts resends (see below) |
 | Driver-wide review | double free, leaks, races, use-after-free on rumble/headset, capture overflow, unaligned read, URB leak, key in log, unplug wait | code review, then built and played |
-| Debug kernel | auth: heap overflow in the transcript export, sleeping allocation in the RX path | found by KASAN and lockdep on the first pad connections and fixed; the fixed build is built and played on the host, not yet re-run under the debug kernel |
+| Debug kernel | auth: heap overflow in the transcript export, sleeping allocation in the RX path | found by KASAN and lockdep on the first pad connections and fixed; the fix is built (0 warnings) but not run yet, on the host or under the debug kernel |
 | Install | `mt76x2u` blacklisted again (it took the old dongle), loaded only for `02fe`; `xpad` no longer blacklisted | reproduced and checked in a Fedora 45 VM |
 | Fuzzing | `tests/fuzz`: GIP parser and headset capture, libFuzzer + ASan/UBSan | finds the old double free and overflow within minutes; found an unaligned read; then ~1.2 billion inputs clean |
 | Community PRs | cherry-picked from dlundqvist/xone, see PR #7 | mostly compile-tested only, see PR #7 |
