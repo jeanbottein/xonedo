@@ -796,9 +796,7 @@ int xone_mt76_load_firmware(struct xone_mt76 *mt, const struct firmware *fw)
 	u32 val;
 	int err;
 
-	mt->warm_start = xone_mt76_read_register(mt, MT_FCE_DMA_ADDR |
-						 MT_VEND_TYPE_CFG);
-	if (mt->warm_start) {
+	if (xone_mt76_read_register(mt, MT_FCE_DMA_ADDR | MT_VEND_TYPE_CFG)) {
 		dev_dbg(mt->dev, "%s: resetting firmware...\n", __func__);
 		xone_mt76_quiesce(mt);
 
@@ -1249,54 +1247,6 @@ static u16 xone_mt76_get_chip_id(struct xone_mt76 *mt)
 	return (id[1] << 8) | id[2];
 }
 
-#define XONE_MT_CLIENT_SLOTS 17	/* client wcid 1..16, plus 0 (firmware uses wcid - 1) */
-
-/* client slots holding a pairwise key (count) and an address (*addrs) */
-static int xone_mt76_count_client_slots(struct xone_mt76 *mt, int *addrs)
-{
-	int i, keys = 0;
-	u32 attr;
-
-	*addrs = 0;
-	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
-		attr = xone_mt76_read_register(mt, MT_WCID_ATTR(i));
-		if (attr & (MT_WCID_ATTR_PKEY_MODE | MT_WCID_ATTR_PAIRWISE))
-			keys++;
-		if (xone_mt76_read_register(mt, MT_WCID_ADDR(i)) ||
-		    (xone_mt76_read_register(mt, MT_WCID_ADDR(i) + 4) & 0xffff))
-			(*addrs)++;
-	}
-
-	return keys;
-}
-
-/*
- * Mainline resets the WCID and key tables at every init; xone only clears a
- * slot on a clean disconnect, and its register init doesn't clear them (seen:
- * 16 slots with a key mode left after a driver reload). A controller that
- * reconnects into such a slot only gets its address rewritten.
- */
-static void xone_mt76_reset_client_slots(struct xone_mt76 *mt, int keys,
-					 int addrs)
-{
-	u8 addr[8] = {}, iv[8] = {}, key[XONE_MT_WCID_KEY_LEN] = {};
-	__le32 attr = 0;
-	int i;
-
-	if (!keys && !addrs)
-		return;
-
-	dev_dbg(mt->dev, "%s: %d slots with a key, %d with an address\n",
-		__func__, keys, addrs);
-
-	for (i = 0; i < XONE_MT_CLIENT_SLOTS; i++) {
-		xone_mt76_write_burst(mt, MT_WCID_ATTR(i), &attr, sizeof(attr));
-		xone_mt76_write_burst(mt, MT_WCID_KEY(i), key, sizeof(key));
-		xone_mt76_write_burst(mt, MT_WCID_IV(i), iv, sizeof(iv));
-		xone_mt76_write_burst(mt, MT_WCID_ADDR(i), addr, sizeof(addr));
-	}
-}
-
 void xone_mt76_stop_rx(struct xone_mt76 *mt)
 {
 	xone_mt76_write_register(mt, MT_MAC_SYS_CTRL, 0);
@@ -1304,15 +1254,7 @@ void xone_mt76_stop_rx(struct xone_mt76 *mt)
 
 int xone_mt76_init_radio(struct xone_mt76 *mt)
 {
-	int err, stale_keys = 0, stale_addrs = 0;
-
-	/*
-	 * Old clients can only be left on a warm chip. A cold chip's table
-	 * holds power-up junk the firmware ignores, and reading or clearing
-	 * it there makes the chip stop answering control transfers.
-	 */
-	if (mt->warm_start)
-		stale_keys = xone_mt76_count_client_slots(mt, &stale_addrs);
+	int err;
 
 	dev_dbg(mt->dev, "%s: id=0x%04x\n", __func__,
 		xone_mt76_get_chip_id(mt));
@@ -1330,7 +1272,6 @@ int xone_mt76_init_radio(struct xone_mt76 *mt)
 		return err;
 
 	xone_mt76_init_registers(mt);
-	xone_mt76_reset_client_slots(mt, stale_keys, stale_addrs);
 
 	err = xone_mt76_calibrate_crystal(mt);
 	if (err)
